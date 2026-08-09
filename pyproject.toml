@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vclip-stock-pipeline"
+version = "0.1.0"
+description = "Turn finished Final Cut Pro libraries into reviewed, reconciled, metadata-rich stock footage packages."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{name = "VClip"}]
+license = {text = "Proprietary"}
+dependencies = []
+
+[project.optional-dependencies]
+visual = ["numpy>=1.26"]
+dev = ["pytest>=8.0", "ruff>=0.9"]
+
+[project.scripts]
+vclip = "vclip_pipeline.cli:main"
+stockify = "vclip_pipeline.cli:stockify_entry"
+reconcile = "vclip_pipeline.cli:reconcile_entry"
+package = "vclip_pipeline.cli:package_entry"
+vclip-package = "vclip_pipeline.cli:package_entry"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+vclip_pipeline = ["data/*.json"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

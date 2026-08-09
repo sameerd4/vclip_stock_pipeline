@@ -1,0 +1,15 @@
+.venv/
+vclip-venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+build/
+dist/
+*.egg-info/
+.DS_Store
+output/
+scripts/_tmp_*
