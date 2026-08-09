@@ -8,7 +8,9 @@ from typing import Any, Iterable
 from ..db.connection import Database
 from ..errors import VClipError
 from ..util import json_dumps, json_loads, stable_id, utc_now
-from .models import NamedSubject, VisualAnalysis, VisualTag
+from .models import NamedSubject, ProviderUsage, VisualAnalysis, VisualTag
+from .search import CatalogSearch
+from .taxonomy import VisualTaxonomy
 
 
 _WORKFLOW_SCHEMA = r"""
@@ -56,6 +58,14 @@ CREATE TABLE IF NOT EXISTS clip_visual_analysis (
     result_json TEXT NOT NULL,
     evidence_json TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('complete','failed','frames_only')),
+    input_tokens INTEGER,
+    cached_input_tokens INTEGER,
+    output_tokens INTEGER,
+    reasoning_tokens INTEGER,
+    total_tokens INTEGER,
+    estimated_input_cost_usd REAL,
+    estimated_output_cost_usd REAL,
+    estimated_total_cost_usd REAL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -106,6 +116,10 @@ CREATE TABLE IF NOT EXISTS clip_named_subjects (
     source TEXT NOT NULL,
     confidence TEXT,
     verified INTEGER NOT NULL DEFAULT 0,
+    raw_name TEXT,
+    canonical_entity_id TEXT,
+    canonical_label TEXT,
+    resolution_source TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(stockify_run_id, stock_clip_id, subject, source)
@@ -161,9 +175,15 @@ CREATE INDEX IF NOT EXISTS idx_collection_version_clips
 class WorkflowCatalog:
     """Persistence boundary for post-export enrichment and merchandising."""
 
-    def __init__(self, database: Database) -> None:
+    def __init__(
+        self,
+        database: Database,
+        *,
+        search: CatalogSearch | None = None,
+    ) -> None:
         self.database = database
         self._fts_available = False
+        self.search_engine = search or CatalogSearch()
         self.ensure_schema()
 
     def ensure_schema(self) -> None:
@@ -173,6 +193,8 @@ class WorkflowCatalog:
                 "INSERT OR IGNORE INTO workflow_schema(version, applied_at) VALUES (1, ?)",
                 (utc_now(),),
             )
+            self._migrate_visual_usage_columns(connection)
+            self._migrate_named_subject_canonical_columns(connection)
             try:
                 connection.execute(
                     """
@@ -186,6 +208,69 @@ class WorkflowCatalog:
                 self._fts_available = True
             except sqlite3.OperationalError:
                 self._fts_available = False
+
+    @staticmethod
+    def _migrate_visual_usage_columns(connection: sqlite3.Connection) -> None:
+        """Add usage/cost columns to older clip_visual_analysis tables."""
+        existing = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(clip_visual_analysis)")
+        }
+        columns = (
+            ("input_tokens", "INTEGER"),
+            ("cached_input_tokens", "INTEGER"),
+            ("output_tokens", "INTEGER"),
+            ("reasoning_tokens", "INTEGER"),
+            ("total_tokens", "INTEGER"),
+            ("estimated_input_cost_usd", "REAL"),
+            ("estimated_output_cost_usd", "REAL"),
+            ("estimated_total_cost_usd", "REAL"),
+        )
+        for name, sql_type in columns:
+            if name not in existing:
+                connection.execute(
+                    f"ALTER TABLE clip_visual_analysis ADD COLUMN {name} {sql_type}"
+                )
+        connection.execute(
+            "INSERT OR IGNORE INTO workflow_schema(version, applied_at) VALUES (2, ?)",
+            (utc_now(),),
+        )
+
+    @staticmethod
+    def _migrate_named_subject_canonical_columns(connection: sqlite3.Connection) -> None:
+        existing = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(clip_named_subjects)")
+        }
+        columns = (
+            ("raw_name", "TEXT"),
+            ("canonical_entity_id", "TEXT"),
+            ("canonical_label", "TEXT"),
+            ("resolution_source", "TEXT"),
+        )
+        for name, sql_type in columns:
+            if name not in existing:
+                connection.execute(
+                    f"ALTER TABLE clip_named_subjects ADD COLUMN {name} {sql_type}"
+                )
+        # Older rows stored the raw suggestion only in subject.
+        connection.execute(
+            """
+            UPDATE clip_named_subjects
+            SET raw_name=subject
+            WHERE raw_name IS NULL OR trim(raw_name)=''
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_clip_named_subjects_entity
+            ON clip_named_subjects(canonical_entity_id, stockify_run_id, stock_clip_id)
+            """
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO workflow_schema(version, applied_at) VALUES (3, ?)",
+            (utc_now(),),
+        )
 
     def upsert_export_media(
         self,
@@ -295,6 +380,7 @@ class WorkflowCatalog:
         taxonomy_version: int,
         analysis: VisualAnalysis,
         evidence: dict[str, Any],
+        usage: ProviderUsage | None = None,
         status: str = "complete",
     ) -> str:
         now = utc_now()
@@ -315,12 +401,17 @@ class WorkflowCatalog:
             "named_subjects": [
                 {
                     "name": subject.name,
+                    "raw_name": subject.raw_name,
                     "confidence": subject.confidence,
                     "verified": subject.verified,
+                    "canonical_entity_id": subject.canonical_entity_id,
+                    "canonical_label": subject.canonical_label,
+                    "resolution_source": subject.resolution_source,
                 }
                 for subject in analysis.named_subjects
             ],
             "raw": analysis.raw,
+            "usage": usage.as_dict() if usage is not None else None,
         }
         with self.database.transaction() as connection:
             connection.execute(
@@ -329,14 +420,30 @@ class WorkflowCatalog:
                     id, analysis_key, analysis_run_id, stockify_run_id,
                     stock_clip_id, export_id, export_sha256, provider, model,
                     taxonomy_version, caption, result_json, evidence_json,
-                    status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status,
+                    input_tokens, cached_input_tokens, output_tokens,
+                    reasoning_tokens, total_tokens,
+                    estimated_input_cost_usd, estimated_output_cost_usd,
+                    estimated_total_cost_usd,
+                    created_at, updated_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
                 ON CONFLICT(analysis_key) DO UPDATE SET
                     analysis_run_id=excluded.analysis_run_id,
                     caption=excluded.caption,
                     result_json=excluded.result_json,
                     evidence_json=excluded.evidence_json,
                     status=excluded.status,
+                    input_tokens=excluded.input_tokens,
+                    cached_input_tokens=excluded.cached_input_tokens,
+                    output_tokens=excluded.output_tokens,
+                    reasoning_tokens=excluded.reasoning_tokens,
+                    total_tokens=excluded.total_tokens,
+                    estimated_input_cost_usd=excluded.estimated_input_cost_usd,
+                    estimated_output_cost_usd=excluded.estimated_output_cost_usd,
+                    estimated_total_cost_usd=excluded.estimated_total_cost_usd,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -354,6 +461,14 @@ class WorkflowCatalog:
                     json_dumps(result),
                     json_dumps(evidence),
                     status,
+                    None if usage is None else usage.input_tokens,
+                    None if usage is None else usage.cached_input_tokens,
+                    None if usage is None else usage.output_tokens,
+                    None if usage is None else usage.reasoning_tokens,
+                    None if usage is None else usage.total_tokens,
+                    None if usage is None else usage.estimated_input_cost_usd,
+                    None if usage is None else usage.estimated_output_cost_usd,
+                    None if usage is None else usage.estimated_total_cost_usd,
                     now,
                     now,
                 ),
@@ -377,6 +492,72 @@ class WorkflowCatalog:
                     "vision",
                 )
         return analysis_id
+
+    def replace_named_subjects(
+        self,
+        *,
+        stockify_run_id: str,
+        stock_clip_id: str,
+        subjects: list[NamedSubject],
+        source: str = "vision",
+    ) -> None:
+        """Rewrite named subjects and patch result_json without touching usage/tags."""
+        now = utc_now()
+        named_payload = [
+            {
+                "name": subject.name,
+                "raw_name": subject.raw_name,
+                "confidence": subject.confidence,
+                "verified": subject.verified,
+                "canonical_entity_id": subject.canonical_entity_id,
+                "canonical_label": subject.canonical_label,
+                "resolution_source": subject.resolution_source,
+            }
+            for subject in subjects
+        ]
+        with self.database.transaction() as connection:
+            connection.execute(
+                """
+                DELETE FROM clip_named_subjects
+                WHERE stockify_run_id=? AND stock_clip_id=? AND source=?
+                """,
+                (stockify_run_id, stock_clip_id, source),
+            )
+            for subject in subjects:
+                self._upsert_named_subject(
+                    connection,
+                    stockify_run_id,
+                    stock_clip_id,
+                    subject,
+                    source,
+                )
+            row = connection.execute(
+                """
+                SELECT result_json
+                FROM clip_visual_analysis
+                WHERE stockify_run_id=? AND stock_clip_id=? AND status='complete'
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (stockify_run_id, stock_clip_id),
+            ).fetchone()
+            if row is None:
+                return
+            payload = json_loads(row["result_json"], {})
+            payload["named_subjects"] = named_payload
+            connection.execute(
+                """
+                UPDATE clip_visual_analysis
+                SET result_json=?, updated_at=?
+                WHERE stockify_run_id=? AND stock_clip_id=? AND status='complete'
+                """,
+                (
+                    json_dumps(payload),
+                    now,
+                    stockify_run_id,
+                    stock_clip_id,
+                ),
+            )
 
     @staticmethod
     def _upsert_tag(
@@ -435,12 +616,17 @@ class WorkflowCatalog:
             """
             INSERT INTO clip_named_subjects(
                 id, stockify_run_id, stock_clip_id, subject, source,
-                confidence, verified, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                confidence, verified, raw_name, canonical_entity_id,
+                canonical_label, resolution_source, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(stockify_run_id, stock_clip_id, subject, source)
             DO UPDATE SET
                 confidence=excluded.confidence,
                 verified=excluded.verified,
+                raw_name=excluded.raw_name,
+                canonical_entity_id=excluded.canonical_entity_id,
+                canonical_label=excluded.canonical_label,
+                resolution_source=excluded.resolution_source,
                 updated_at=excluded.updated_at
             """,
             (
@@ -451,6 +637,10 @@ class WorkflowCatalog:
                 source,
                 subject.confidence,
                 int(subject.verified),
+                subject.raw_name,
+                subject.canonical_entity_id,
+                subject.canonical_label,
+                subject.resolution_source,
                 now,
                 now,
             ),
@@ -665,7 +855,9 @@ class WorkflowCatalog:
                 ).fetchone()
                 subject_rows = connection.execute(
                     """
-                    SELECT subject, source, confidence, verified
+                    SELECT subject, source, confidence, verified,
+                           raw_name, canonical_entity_id, canonical_label,
+                           resolution_source
                     FROM clip_named_subjects
                     WHERE stockify_run_id=? AND stock_clip_id=?
                     ORDER BY verified DESC, subject
@@ -718,7 +910,20 @@ class WorkflowCatalog:
             connection.execute("DELETE FROM clip_search_documents")
             if self._fts_available:
                 connection.execute("DELETE FROM clip_search_fts")
+            taxonomy = (
+                self.search_engine.taxonomy
+                if hasattr(self.search_engine, "taxonomy")
+                else VisualTaxonomy.default()
+            )
             for row in rows:
+                tag_labels = []
+                for item in row.get("tags", []):
+                    tag_id = item.get("tag")
+                    if not tag_id:
+                        continue
+                    label = taxonomy.label_for(str(tag_id))
+                    if label:
+                        tag_labels.append(label)
                 text_values = [
                     row.get("public_label"),
                     row.get("city"),
@@ -728,10 +933,30 @@ class WorkflowCatalog:
                     row.get("generated_project_label"),
                     row.get("caption"),
                     row.get("orientation"),
+                    row.get("time_of_day"),
                     *(item.get("market_label") for item in row.get("markets", [])),
                     *(item.get("market_id") for item in row.get("markets", [])),
                     *(item.get("tag") for item in row.get("tags", [])),
-                    *(item.get("subject") for item in row.get("named_subjects", [])),
+                    *tag_labels,
+                    *(
+                        item.get("tag_group")
+                        for item in row.get("tags", [])
+                        if item.get("tag_group")
+                    ),
+                    *(
+                        item.get("raw_name") or item.get("subject")
+                        for item in row.get("named_subjects", [])
+                    ),
+                    *(
+                        item.get("canonical_label")
+                        for item in row.get("named_subjects", [])
+                        if item.get("canonical_label")
+                    ),
+                    *(
+                        item.get("canonical_entity_id")
+                        for item in row.get("named_subjects", [])
+                        if item.get("canonical_entity_id")
+                    ),
                 ]
                 document = " ".join(str(value) for value in text_values if value)
                 connection.execute(
@@ -758,49 +983,28 @@ class WorkflowCatalog:
                     )
         return len(rows)
 
-    def search(self, query: str, *, limit: int = 50) -> list[dict[str, Any]]:
-        if not query.strip():
-            return self.catalog_rows()[:limit]
-        with self.database.connect() as connection:
-            if self._fts_available:
-                try:
-                    keys = connection.execute(
-                        """
-                        SELECT stockify_run_id, stock_clip_id, bm25(clip_search_fts) AS rank
-                        FROM clip_search_fts
-                        WHERE clip_search_fts MATCH ?
-                        ORDER BY rank
-                        LIMIT ?
-                        """,
-                        (query, limit),
-                    ).fetchall()
-                except sqlite3.OperationalError:
-                    keys = []
-            else:
-                keys = []
-            if not keys:
-                pattern = f"%{query.casefold()}%"
-                keys = connection.execute(
-                    """
-                    SELECT stockify_run_id, stock_clip_id, 0.0 AS rank
-                    FROM clip_search_documents
-                    WHERE lower(document_text) LIKE ?
-                    LIMIT ?
-                    """,
-                    (pattern, limit),
-                ).fetchall()
-        all_rows = {
-            (row["stockify_run_id"], row["stock_clip_id"]): row
-            for row in self.catalog_rows()
-        }
-        result = []
-        for key in keys:
-            row = all_rows.get((key["stockify_run_id"], key["stock_clip_id"]))
-            if row:
-                row = dict(row)
-                row["search_rank"] = key["rank"]
-                result.append(row)
-        return result
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 50,
+        explain: bool = False,
+        run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Evidence-aware search over enriched catalog rows.
+
+        Query aliases and taxonomy labels are normalized before scoring. Ranking
+        rewards canonical entities, controlled tags by strength, raw named
+        subjects, then caption/location text. Multi-concept queries strongly
+        prefer clips that match every concept.
+        """
+        rows = self.catalog_rows(run_id=run_id)
+        return self.search_engine.rank(
+            rows,
+            query,
+            limit=limit,
+            explain=explain,
+        )
 
     def save_collection_definition(
         self,

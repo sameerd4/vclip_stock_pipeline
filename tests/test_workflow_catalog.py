@@ -6,7 +6,7 @@ from vclip_pipeline.reconcile import ReconcileService
 from vclip_pipeline.workflow.catalog import WorkflowCatalog
 from vclip_pipeline.workflow.collections import CollectionService
 from vclip_pipeline.workflow.export_ingest import ExportIngestService
-from vclip_pipeline.workflow.models import VisualAnalysis, VisualTag
+from vclip_pipeline.workflow.models import ProviderUsage, VisualAnalysis, VisualTag
 
 
 def _ingest_one(pipeline_run):
@@ -82,6 +82,13 @@ def test_visual_tags_are_searchable_and_collection_is_snapshot(pipeline_run):
     catalog.rebuild_search_index()
     results = catalog.search("waterfront", limit=10)
     assert [row["stock_clip_id"] for row in results] == [target["stock_clip_id"]]
+    road_results = catalog.search("roads", limit=10, explain=True)
+    assert [row["stock_clip_id"] for row in road_results] == [target["stock_clip_id"]]
+    assert road_results[0]["search_score"] >= 40.0
+    assert any(
+        item["kind"] == "exact_primary_tag" and item["label"] == "road"
+        for item in road_results[0]["search_explain"]["contributions"]
+    )
 
     service = CollectionService(catalog)
     suggestion = service.suggest(
@@ -110,3 +117,64 @@ def test_visual_tags_are_searchable_and_collection_is_snapshot(pipeline_run):
     assert (materialized / "manifest.json").is_file()
     assert len(list((materialized / "clips").glob("*.mp4"))) == 1
     assert exported.is_file()
+
+
+def test_visual_analysis_persists_provider_usage(pipeline_run):
+    catalog, target, stored, _exported = _ingest_one(pipeline_run)
+    usage = ProviderUsage(
+        provider="openai",
+        model="gpt-5-mini",
+        input_tokens=1200,
+        cached_input_tokens=300,
+        output_tokens=450,
+        reasoning_tokens=100,
+        total_tokens=1650,
+        estimated_input_cost_usd=0.0003,
+        estimated_output_cost_usd=0.0009,
+        estimated_total_cost_usd=0.0012,
+    )
+    catalog.upsert_visual_analysis(
+        analysis_key="ANALYSIS_USAGE",
+        analysis_run_id=catalog.start_visual_run(
+            provider="openai",
+            model="gpt-5-mini",
+            taxonomy_version=1,
+            prompt_version="visual-taxonomy-v2",
+            sampler_version="test",
+            config={},
+        ),
+        stockify_run_id=pipeline_run["result"].stockify_run_id,
+        stock_clip_id=target["stock_clip_id"],
+        export_id=stored["id"],
+        export_sha256=stored["sha256"],
+        provider="openai",
+        model="gpt-5-mini",
+        taxonomy_version=1,
+        analysis=VisualAnalysis(
+            caption="A waterfront road.",
+            tags=(VisualTag("subject", "road", "primary", 0.9),),
+        ),
+        evidence={},
+        usage=usage,
+    )
+    with catalog.database.connect() as connection:
+        row = connection.execute(
+            """
+            SELECT provider, model, input_tokens, cached_input_tokens, output_tokens,
+                   reasoning_tokens, total_tokens, estimated_input_cost_usd,
+                   estimated_output_cost_usd, estimated_total_cost_usd, result_json
+            FROM clip_visual_analysis
+            WHERE analysis_key=?
+            """,
+            ("ANALYSIS_USAGE",),
+        ).fetchone()
+    assert row["provider"] == "openai"
+    assert row["model"] == "gpt-5-mini"
+    assert row["input_tokens"] == 1200
+    assert row["cached_input_tokens"] == 300
+    assert row["output_tokens"] == 450
+    assert row["reasoning_tokens"] == 100
+    assert row["total_tokens"] == 1650
+    assert abs(row["estimated_total_cost_usd"] - 0.0012) < 1e-12
+    payload = __import__("json").loads(row["result_json"])
+    assert payload["usage"]["cached_input_tokens"] == 300

@@ -1,16 +1,16 @@
 {
-  "version": 1,
+  "version": 2,
   "groups": {
     "scene": [
       {"id": "city_urban", "label": "City & Urban", "description": "Dense or clearly urban built environment."},
       {"id": "residential", "label": "Residential", "description": "Homes, apartments, or residential neighborhoods are visually central."},
       {"id": "industrial", "label": "Industrial", "description": "Warehouses, ports, factories, or industrial infrastructure are central."},
-      {"id": "coastal", "label": "Coastal", "description": "Ocean, beach, cliffs, or coastal environment is visually central."},
+      {"id": "coastal", "label": "Coastal", "description": "Open ocean, beach, sea cliffs, or exposed ocean coastline is visually central. Do not use for bay, marina, harbor, river, lake, or urban waterfront alone."},
       {"id": "nature", "label": "Nature", "description": "Natural landscape is visually dominant."}
     ],
     "subject": [
       {"id": "road", "label": "Roads", "description": "A road, highway, intersection, or moving road network is a meaningful subject, not a tiny incidental detail."},
-      {"id": "waterfront", "label": "Waterfront", "description": "Water and the built or natural edge beside it are meaningful subjects."},
+      {"id": "waterfront", "label": "Waterfront", "description": "Bay, marina, harbor, river edge, lake edge, or urban water edge is a meaningful subject. Prefer waterfront over coastal unless ocean/beach/cliff coastline is clearly central."},
       {"id": "architecture", "label": "Architecture", "description": "Buildings or designed structures are a meaningful subject."},
       {"id": "skyline", "label": "Skyline", "description": "A recognizable city skyline or broad building silhouette is central."},
       {"id": "bridge", "label": "Bridge", "description": "A bridge is visibly meaningful in the composition."},
@@ -25,7 +25,7 @@
       {"id": "night", "label": "Night", "description": "The scene is clearly nighttime or dominated by artificial light."}
     ],
     "use": [
-      {"id": "establishing", "label": "Establishing", "description": "A broad, readable view that can introduce a place or setting."},
+      {"id": "establishing", "label": "Establishing", "description": "Footage suitable to introduce a place or setting before a tighter scene. Common for aerial place-establishing shots; expected often. Always pair with subject/scene tags that describe what is being established."},
       {"id": "background", "label": "Background", "description": "Visually steady footage suitable behind text, narration, or graphics."},
       {"id": "transition", "label": "Transition", "description": "A dynamic movement or reveal suitable between scenes."},
       {"id": "detail", "label": "Detail", "description": "A tighter view focused on a specific visual detail rather than a broad setting."}

@@ -12,8 +12,14 @@ from pathlib import Path
 from ..db import CatalogRepository, Database
 from ..errors import VClipError
 from .catalog import WorkflowCatalog
+from .catalog_quality import (
+    CatalogQualityService,
+    format_quality_report,
+    write_quality_report,
+)
 from .collections import CollectionService, CollectionSuggestion, load_rule
-from .enrichment import VisualEnrichmentService
+from .enrichment import VisualEnrichmentService, format_openai_usage_block
+from .entities import EntityCatalog
 from .export_ingest import ExportIngestService
 from .frames import FrameSampler
 from .providers import OpenAIVisualAnalyzer
@@ -149,8 +155,52 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("query")
     search.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
     search.add_argument("--limit", type=_positive_int, default=50)
+    search.add_argument(
+        "--explain",
+        action="store_true",
+        help="Show score contributions for each result.",
+    )
     search.add_argument("--json", action="store_true")
     search.set_defaults(handler=_run_catalog_search)
+    audit = catalog_sub.add_parser(
+        "audit",
+        help="Audit visual-enrichment quality for a run/cohort (no OpenAI calls).",
+    )
+    audit.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    audit.add_argument("--run-id")
+    audit.add_argument("--report", type=Path)
+    audit.add_argument("--no-diagnostics", action="store_true")
+    audit.add_argument("--json", action="store_true")
+    audit.set_defaults(handler=_run_catalog_audit)
+
+    catalog_audit = sub.add_parser(
+        "catalog-audit",
+        help="Alias for 'catalog audit': visual enrichment quality report.",
+    )
+    catalog_audit.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    catalog_audit.add_argument("--run-id")
+    catalog_audit.add_argument("--report", type=Path)
+    catalog_audit.add_argument("--no-diagnostics", action="store_true")
+    catalog_audit.add_argument("--json", action="store_true")
+    catalog_audit.set_defaults(handler=_run_catalog_audit)
+
+    canonicalize = sub.add_parser(
+        "canonicalize-entities",
+        help=(
+            "Resolve persisted named-subject suggestions to canonical entities "
+            "without calling OpenAI or re-extracting frames."
+        ),
+    )
+    canonicalize.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    canonicalize.add_argument("--run-id")
+    canonicalize.add_argument(
+        "--entities",
+        type=Path,
+        default=_data_path("visual_entities.json"),
+    )
+    canonicalize.add_argument("--dry-run", action="store_true")
+    canonicalize.add_argument("--report", type=Path)
+    canonicalize.set_defaults(handler=_run_canonicalize_entities)
 
     collections = sub.add_parser("collections", help="Suggest and freeze sellable clip sets.")
     collection_sub = collections.add_subparsers(dest="collection_command", required=True)
@@ -277,6 +327,13 @@ def _run_enrich(args: argparse.Namespace) -> int:
     print(f"Cached:             {result.cached}")
     print(f"Analyzed:           {result.analyzed}")
     print(f"Failed:             {result.failed}")
+    usage_lines = format_openai_usage_block(result)
+    if usage_lines:
+        print()
+        for line in usage_lines:
+            print(line)
+    for warning in result.warnings:
+        print(f"warning: {warning}")
     if args.html:
         print(f"Review HTML:        {args.html}")
     return 0
@@ -289,19 +346,79 @@ def _run_catalog_reindex(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_catalog_audit(args: argparse.Namespace) -> int:
+    _, workflow = _catalog(args.db)
+    service = CatalogQualityService(workflow)
+    report = service.audit(
+        run_id=args.run_id,
+        include_diagnostics=not args.no_diagnostics,
+    )
+    if args.report:
+        write_quality_report(args.report.expanduser().resolve(), report)
+        print(f"Report: {args.report}")
+    if args.json:
+        print(json.dumps(report.as_dict(), indent=2, ensure_ascii=False))
+    else:
+        for line in format_quality_report(report):
+            print(line)
+    return 0
+
+
+def _run_canonicalize_entities(args: argparse.Namespace) -> int:
+    _, workflow = _catalog(args.db)
+    entities = EntityCatalog.from_path(args.entities.expanduser().resolve())
+    service = CatalogQualityService(workflow, entities=entities)
+    result = service.canonicalize_entities(
+        run_id=args.run_id,
+        dry_run=args.dry_run,
+    )
+    if args.report:
+        path = args.report.expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(result, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        print(f"Report: {path}")
+    print("Entity canonicalization")
+    print("-----------------------")
+    print(f"Clips considered:   {result['clips_considered']}")
+    print(f"Clips updated:      {result['clips_updated']}")
+    print(f"Subjects resolved:  {result['subjects_resolved']}")
+    print(f"Subjects unresolved:{result['subjects_unresolved']}")
+    if args.dry_run:
+        print("Dry run:            no database writes")
+    return 0
+
+
 def _run_catalog_search(args: argparse.Namespace) -> int:
     _, workflow = _catalog(args.db)
-    rows = workflow.search(args.query, limit=args.limit)
+    rows = workflow.search(
+        args.query,
+        limit=args.limit,
+        explain=bool(args.explain),
+    )
     if args.json:
         print(json.dumps(rows, indent=2, ensure_ascii=False, default=str))
         return 0
     for row in rows:
         tags = ", ".join(item["tag"] for item in row.get("tags", [])[:6])
         markets = ", ".join(item["market_label"] for item in row.get("markets", []))
-        print(f"{row['stock_clip_id']}  {markets or '-'}  {tags or '-'}")
+        score = row.get("search_score")
+        score_text = f"  score={score:.1f}" if isinstance(score, (int, float)) else ""
+        print(f"{row['stock_clip_id']}{score_text}  {markets or '-'}  {tags or '-'}")
         if row.get("caption"):
             print(f"    {row['caption']}")
         print(f"    {row['exported_path']}")
+        if args.explain:
+            explanation = row.get("search_explain") or {}
+            for item in explanation.get("contributions", []):
+                points = item.get("points", 0.0)
+                detail = f" ({item['detail']})" if item.get("detail") else ""
+                print(
+                    f"    +{points:.1f}  {item.get('kind')}  "
+                    f"{item.get('label')}{detail}"
+                )
     print(f"\nResults: {len(rows)}")
     return 0
 

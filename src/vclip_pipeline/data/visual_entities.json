@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "entities": [
+    {
+      "id": "ENTITY_SALESFORCE_TOWER",
+      "label": "Salesforce Tower",
+      "aliases": [
+        "Salesforce Tower",
+        "Salesforce Tower (San Francisco)",
+        "Salesforce Tower, San Francisco",
+        "Salesforce Tower SF"
+      ]
+    },
+    {
+      "id": "ENTITY_FERRY_BUILDING",
+      "label": "Ferry Building",
+      "aliases": [
+        "Ferry Building",
+        "San Francisco Ferry Building",
+        "San Francisco Ferry Building (clock tower)",
+        "Ferry Building (clock tower)",
+        "San Francisco Embarcadero / Ferry Building",
+        "Embarcadero Ferry Building",
+        "SF Ferry Building"
+      ]
+    },
+    {
+      "id": "ENTITY_BAY_BRIDGE",
+      "label": "Bay Bridge",
+      "aliases": [
+        "Bay Bridge",
+        "San Francisco–Oakland Bay Bridge",
+        "San Francisco-Oakland Bay Bridge",
+        "SF Bay Bridge",
+        "Oakland Bay Bridge"
+      ]
+    },
+    {
+      "id": "ENTITY_GOLDEN_GATE_BRIDGE",
+      "label": "Golden Gate Bridge",
+      "aliases": [
+        "Golden Gate Bridge",
+        "Golden Gate",
+        "the Golden Gate Bridge"
+      ]
+    },
+    {
+      "id": "ENTITY_PALACE_OF_FINE_ARTS",
+      "label": "Palace of Fine Arts",
+      "aliases": [
+        "Palace of Fine Arts",
+        "Palace of Fine Arts, San Francisco",
+        "San Francisco Palace of Fine Arts"
+      ]
+    },
+    {
+      "id": "ENTITY_TRANSAMERICA_PYRAMID",
+      "label": "Transamerica Pyramid",
+      "aliases": [
+        "Transamerica Pyramid",
+        "Transamerica Pyramid (San Francisco)",
+        "Transamerica Building"
+      ]
+    },
+    {
+      "id": "ENTITY_COIT_TOWER",
+      "label": "Coit Tower",
+      "aliases": [
+        "Coit Tower",
+        "Coit Tower (San Francisco)"
+      ]
+    },
+    {
+      "id": "ENTITY_ALCATRAZ",
+      "label": "Alcatraz",
+      "aliases": [
+        "Alcatraz",
+        "Alcatraz Island",
+        "Alcatraz Island (San Francisco)"
+      ]
+    }
+  ]
+}

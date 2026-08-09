@@ -129,6 +129,9 @@ class CollectionService:
     def _score(row: dict[str, Any], preferred: set[str]) -> float:
         score = 0.0
         strength_weight = {"primary": 3.0, "secondary": 1.5, "context": 0.25}
+        # Establishing is a common aerial editorial purpose — useful to filter,
+        # but weakly informative for ranking versus subject/style tags.
+        low_signal_tags = {"establishing"}
         for tag in row.get("tags", []):
             tag_name = str(tag.get("tag") or "")
             confidence = tag.get("score")
@@ -137,9 +140,13 @@ class CollectionService:
             except (TypeError, ValueError):
                 confidence_value = 0.75
             weight = strength_weight.get(str(tag.get("strength") or "context"), 0.25)
+            if tag_name in low_signal_tags:
+                weight *= 0.15
             score += weight * confidence_value
-            if tag_name in preferred:
+            if tag_name in preferred and tag_name not in low_signal_tags:
                 score += 2.0 * confidence_value
+            elif tag_name in preferred:
+                score += 0.25 * confidence_value
         duration = (
             row.get("export_duration_seconds")
             or row.get("final_duration_seconds")
