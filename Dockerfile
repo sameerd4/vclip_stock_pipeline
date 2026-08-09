@@ -7,7 +7,9 @@ RUN apt-get update \
 WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip install --no-cache-dir ".[visual]"
+COPY bin/docker-entrypoint /usr/local/bin/vclip-entrypoint
+RUN chmod +x /usr/local/bin/vclip-entrypoint \
+    && pip install --no-cache-dir ".[visual]"
 
-ENTRYPOINT ["vclip"]
+ENTRYPOINT ["vclip-entrypoint"]
 CMD ["--help"]
