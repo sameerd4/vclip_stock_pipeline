@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vclip-stock-pipeline"
-version = "0.1.0"
-description = "Turn finished Final Cut Pro libraries into reviewed, reconciled, metadata-rich stock footage packages."
+version = "0.2.0"
+description = "Turn finished Final Cut Pro libraries into reviewed, reconciled, searchable stock footage collections."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{name = "VClip"}]
@@ -22,6 +22,7 @@ stockify = "vclip_pipeline.cli:stockify_entry"
 reconcile = "vclip_pipeline.cli:reconcile_entry"
 package = "vclip_pipeline.cli:package_entry"
 vclip-package = "vclip_pipeline.cli:package_entry"
+vclip-workflow = "vclip_pipeline.workflow.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

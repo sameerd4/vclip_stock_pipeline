@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "markets": [
+    {"id": "seattle", "label": "Seattle", "cities": ["Seattle"]},
+    {"id": "seattle-eastside", "label": "Seattle Eastside", "cities": ["Bellevue", "Redmond", "Kirkland", "Mercer Island"]},
+    {"id": "tacoma", "label": "Tacoma", "cities": ["Tacoma"]},
+    {"id": "san-francisco", "label": "San Francisco", "cities": ["San Francisco"]},
+    {"id": "south-bay", "label": "South Bay", "cities": ["San Jose", "Fremont", "Campbell", "Santa Clara", "Sunnyvale", "Mountain View"]},
+    {"id": "east-bay", "label": "East Bay", "cities": ["Berkeley", "Oakland", "Emeryville"]},
+    {"id": "peninsula-coast", "label": "Peninsula & Coast", "cities": ["Half Moon Bay", "Pacifica"]},
+    {"id": "santa-cruz", "label": "Santa Cruz", "cities": ["Santa Cruz", "Capitola"]},
+    {"id": "virginia", "label": "Virginia", "cities": ["Blacksburg", "Charlottesville", "Troutville", "Fairfax"]},
+    {"id": "oregon", "label": "Oregon", "cities": ["Eugene", "Portland"]}
+  ]
+}
