@@ -1,0 +1,9 @@
+{
+  "markets": ["san-francisco"],
+  "required_tags": ["waterfront"],
+  "preferred_tags": ["golden_hour", "establishing"],
+  "minimum_clips": 6,
+  "maximum_clips": 10,
+  "maximum_per_source_media": 2,
+  "maximum_per_session": 4
+}
