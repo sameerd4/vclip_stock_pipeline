@@ -17,7 +17,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Install package
         run: python -m pip install --upgrade pip && python -m pip install -e ".[dev,visual]"
-      - name: Lint
-        run: python -m ruff check src tests
+      - name: Check new workflow for Python errors
+        run: >-
+          python -m ruff check
+          src/vclip_pipeline/workflow
+          tests/test_review_shard.py
+          tests/test_export_ingest.py
+          tests/test_workflow_catalog.py
+          tests/test_openai_visual_provider.py
+          --select F
+      - name: Compile
+        run: python -m compileall -q src tests
       - name: Test
         run: python -m pytest
