@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -222,13 +223,9 @@ class NominatimLocationResolver:
                 "zoom": "18",
             }
         )
-        request = urllib.request.Request(
-            f"https://nominatim.openstreetmap.org/reverse?{query}",
-            headers={"User-Agent": self.user_agent},
-        )
+        url = f"https://nominatim.openstreetmap.org/reverse?{query}"
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:  # noqa: S310
-                payload = json.loads(response.read().decode("utf-8"))
+            payload = _fetch_nominatim_json(url, user_agent=self.user_agent)
         except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
             logger.debug(
                 "Nominatim unavailable for %.5f, %.5f: %s",
@@ -236,6 +233,8 @@ class NominatimLocationResolver:
                 longitude,
                 exc,
             )
+            return None
+        if payload is None:
             return None
 
         self._last_request_at = time.monotonic()
@@ -397,3 +396,58 @@ def build_location_resolver(
             )
         )
     return CompositeLocationResolver(resolvers)
+
+
+def _fetch_nominatim_json(url: str, *, user_agent: str) -> dict[str, Any] | None:
+    """Fetch Nominatim JSON via urllib, with curl fallback for broken SSL stores."""
+    request = urllib.request.Request(url, headers={"User-Agent": user_agent})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:  # noqa: S310
+            return json.loads(response.read().decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 — narrow to SSL/network; re-raise others below
+        if isinstance(exc, json.JSONDecodeError):
+            raise
+        reason = str(getattr(exc, "reason", None) or exc)
+        upper = reason.upper()
+        if "CERTIFICATE" in upper or "SSL" in upper or type(exc).__name__ == "SSLError":
+            logger.debug(
+                "urllib SSL failed for Nominatim; trying curl fallback: %s", exc
+            )
+            return _curl_nominatim_json(url, user_agent=user_agent)
+        if isinstance(exc, (urllib.error.URLError, TimeoutError, OSError)):
+            raise
+        raise
+
+
+def _curl_nominatim_json(url: str, *, user_agent: str) -> dict[str, Any] | None:
+    try:
+        completed = subprocess.run(
+            [
+                "curl",
+                "-sS",
+                "-L",
+                "--max-time",
+                "20",
+                "-A",
+                user_agent,
+                url,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        logger.debug("curl Nominatim fallback unavailable: %s", exc)
+        return None
+    if completed.returncode != 0 or not completed.stdout.strip():
+        logger.debug(
+            "curl Nominatim fallback failed rc=%s stderr=%s",
+            completed.returncode,
+            (completed.stderr or "")[:200],
+        )
+        return None
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None

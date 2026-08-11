@@ -15,6 +15,7 @@ from urllib.parse import unquote
 from .constants import (
     SIDECAR_EXTENSIONS,
     SKIPPED_SCAN_DIR_NAMES,
+    SRT_BRACKET_FIELD_RE,
     SRT_DATETIME_RE,
     SRT_NUMERIC_FIELD_RE,
     SRT_TIME_RE,
@@ -359,6 +360,44 @@ def parse_srt_payload_datetime(payload: str) -> datetime | None:
         except ValueError:
             continue
     return None
+
+
+def extract_srt_color_md(path: Path, *, max_cues: int = 40) -> str | None:
+    """Return the dominant literal color_md value from a DJI SRT, if present.
+
+    Preserves source literals such as ``dlog_m`` and ``default``; does not infer
+    Normal/HLG/etc. from ``default``.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    counts: dict[str, int] = {}
+    cues_seen = 0
+    for match in SRT_TIME_RE.finditer(text):
+        cues_seen += 1
+        if cues_seen > max_cues:
+            break
+        # Inspect the payload window after the cue clock line.
+        window = text[match.end() : match.end() + 500]
+        for key, value in SRT_BRACKET_FIELD_RE.findall(window):
+            if key.lower() != "color_md":
+                continue
+            literal = value.strip()
+            if not literal:
+                continue
+            counts[literal] = counts.get(literal, 0) + 1
+    if not counts:
+        # Fallback: scan whole file when cue windows missed the field.
+        for key, value in SRT_BRACKET_FIELD_RE.findall(text):
+            if key.lower() != "color_md":
+                continue
+            literal = value.strip()
+            if literal:
+                counts[literal] = counts.get(literal, 0) + 1
+    if not counts:
+        return None
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
 
 
 # Parse timing, GPS, altitude, and orientation availability from an SRT.

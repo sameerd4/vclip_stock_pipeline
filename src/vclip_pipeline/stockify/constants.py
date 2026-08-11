@@ -54,6 +54,8 @@ SRT_DATETIME_RE = re.compile(
     r"(\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?)\b"
 )
 SRT_NUMERIC_FIELD_RE = re.compile(r"\b([A-Za-z_]+):\s*(-?\d+(?:\.\d+)?)")
+# DJI bracket telemetry also carries non-numeric fields such as color_md.
+SRT_BRACKET_FIELD_RE = re.compile(r"\[\s*([A-Za-z_]+)\s*:\s*([^\]]+?)\s*\]")
 DJI_FILENAME_TIMESTAMP_RE = re.compile(r"\bDJI_(\d{8})(\d{6})_", re.I)
 
 KNOWN_PLACES = [
