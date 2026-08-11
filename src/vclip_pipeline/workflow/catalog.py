@@ -169,6 +169,125 @@ CREATE TABLE IF NOT EXISTS collection_version_clips (
 
 CREATE INDEX IF NOT EXISTS idx_collection_version_clips
     ON collection_version_clips(collection_version_id, sort_order);
+
+CREATE TABLE IF NOT EXISTS review_dedupe_removals (
+    id TEXT PRIMARY KEY,
+    stockify_run_id TEXT NOT NULL,
+    removed_stock_clip_id TEXT NOT NULL,
+    kept_stock_clip_id TEXT NOT NULL,
+    removed_project_name TEXT NOT NULL,
+    kept_project_name TEXT NOT NULL,
+    source_media TEXT,
+    source_start TEXT,
+    source_duration TEXT,
+    reason TEXT NOT NULL,
+    containment REAL,
+    iou REAL,
+    source_fcpxml TEXT,
+    output_fcpxml TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(stockify_run_id, removed_stock_clip_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_dedupe_removals_run
+    ON review_dedupe_removals(stockify_run_id, removed_stock_clip_id);
+
+CREATE TABLE IF NOT EXISTS review_global_dedupe_removals (
+    id TEXT PRIMARY KEY,
+    stockify_run_id TEXT NOT NULL,
+    removed_stock_clip_id TEXT NOT NULL,
+    canonical_stock_clip_id TEXT NOT NULL,
+    cluster_id TEXT NOT NULL,
+    cluster_type TEXT NOT NULL,
+    source_media TEXT,
+    canonical_source_start TEXT,
+    canonical_source_duration TEXT,
+    reason TEXT NOT NULL,
+    containment REAL,
+    iou REAL,
+    source_shard TEXT,
+    removed_project_name TEXT,
+    kept_project_name TEXT,
+    provenance_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE(stockify_run_id, removed_stock_clip_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_global_dedupe_removals_run
+    ON review_global_dedupe_removals(stockify_run_id, removed_stock_clip_id);
+
+CREATE TABLE IF NOT EXISTS review_short_prune_removals (
+    id TEXT PRIMARY KEY,
+    stockify_run_id TEXT NOT NULL,
+    removed_stock_clip_id TEXT NOT NULL,
+    removed_project_name TEXT,
+    reason TEXT NOT NULL,
+    effective_duration_seconds REAL NOT NULL,
+    min_duration_seconds REAL NOT NULL,
+    candidate_tier TEXT,
+    short_clip_recovery TEXT,
+    source_shard TEXT,
+    input_xml TEXT,
+    output_xml TEXT,
+    provenance_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE(stockify_run_id, removed_stock_clip_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_short_prune_removals_run
+    ON review_short_prune_removals(stockify_run_id, removed_stock_clip_id);
+
+CREATE TABLE IF NOT EXISTS review_location_recoveries (
+    id TEXT PRIMARY KEY,
+    stockify_run_id TEXT NOT NULL,
+    stock_clip_id TEXT NOT NULL,
+    original_event_name TEXT,
+    new_event_name TEXT,
+    original_project_name TEXT,
+    new_project_name TEXT,
+    source_media TEXT,
+    srt_paths_json TEXT NOT NULL DEFAULT '[]',
+    representative_lat REAL,
+    representative_lon REAL,
+    resolution_confidence TEXT NOT NULL,
+    recovery_reason TEXT NOT NULL,
+    source_shard TEXT,
+    input_xml TEXT,
+    output_xml TEXT,
+    provenance_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE(stockify_run_id, stock_clip_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_location_recoveries_run
+    ON review_location_recoveries(stockify_run_id, stock_clip_id);
+
+CREATE TABLE IF NOT EXISTS review_color_repairs (
+    id TEXT PRIMARY KEY,
+    stockify_run_id TEXT NOT NULL,
+    stock_clip_id TEXT NOT NULL,
+    source_media TEXT,
+    camera_model TEXT,
+    color_md TEXT,
+    previous_camera_lut TEXT,
+    new_camera_lut TEXT,
+    previous_xml_lut_identity TEXT,
+    new_xml_lut_identity TEXT,
+    previous_effect_signature TEXT,
+    new_effect_signature TEXT,
+    repair_reason TEXT NOT NULL,
+    source_shard TEXT,
+    project_name TEXT,
+    input_xml TEXT,
+    output_xml TEXT,
+    srt_path TEXT,
+    provenance_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE(stockify_run_id, stock_clip_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_color_repairs_run
+    ON review_color_repairs(stockify_run_id, stock_clip_id);
 """
 
 
@@ -195,6 +314,7 @@ class WorkflowCatalog:
             )
             self._migrate_visual_usage_columns(connection)
             self._migrate_named_subject_canonical_columns(connection)
+            self._migrate_review_dedupe_metric_columns(connection)
             try:
                 connection.execute(
                     """
@@ -269,6 +389,24 @@ class WorkflowCatalog:
         )
         connection.execute(
             "INSERT OR IGNORE INTO workflow_schema(version, applied_at) VALUES (3, ?)",
+            (utc_now(),),
+        )
+
+    @staticmethod
+    def _migrate_review_dedupe_metric_columns(connection: sqlite3.Connection) -> None:
+        existing = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(review_dedupe_removals)")
+        }
+        if not existing:
+            return
+        for name, sql_type in (("containment", "REAL"), ("iou", "REAL")):
+            if name not in existing:
+                connection.execute(
+                    f"ALTER TABLE review_dedupe_removals ADD COLUMN {name} {sql_type}"
+                )
+        connection.execute(
+            "INSERT OR IGNORE INTO workflow_schema(version, applied_at) VALUES (4, ?)",
             (utc_now(),),
         )
 
@@ -1150,3 +1288,415 @@ class WorkflowCatalog:
                 for row in clip_rows
             ],
         }
+
+    def record_review_dedupe_removals(
+        self,
+        *,
+        stockify_run_id: str,
+        removals: Iterable[Any],
+        source_fcpxml: str,
+        output_fcpxml: str,
+    ) -> int:
+        """Persist XML-only dedupe suppressions so reconcile treats them as out-of-scope."""
+        now = utc_now()
+        count = 0
+        with self.database.transaction() as connection:
+            for item in removals:
+                removal_id = stable_id(
+                    "DEDUPE",
+                    stockify_run_id,
+                    getattr(item, "removed_stock_clip_id"),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO review_dedupe_removals(
+                        id, stockify_run_id, removed_stock_clip_id, kept_stock_clip_id,
+                        removed_project_name, kept_project_name, source_media,
+                        source_start, source_duration, reason, containment, iou,
+                        source_fcpxml, output_fcpxml, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(stockify_run_id, removed_stock_clip_id) DO UPDATE SET
+                        kept_stock_clip_id=excluded.kept_stock_clip_id,
+                        removed_project_name=excluded.removed_project_name,
+                        kept_project_name=excluded.kept_project_name,
+                        source_media=excluded.source_media,
+                        source_start=excluded.source_start,
+                        source_duration=excluded.source_duration,
+                        reason=excluded.reason,
+                        containment=excluded.containment,
+                        iou=excluded.iou,
+                        source_fcpxml=excluded.source_fcpxml,
+                        output_fcpxml=excluded.output_fcpxml,
+                        created_at=excluded.created_at
+                    """,
+                    (
+                        removal_id,
+                        stockify_run_id,
+                        getattr(item, "removed_stock_clip_id"),
+                        getattr(item, "kept_stock_clip_id"),
+                        getattr(item, "removed_project_name"),
+                        getattr(item, "kept_project_name"),
+                        getattr(item, "source_media", None),
+                        getattr(item, "source_start", None),
+                        getattr(item, "source_duration", None),
+                        getattr(item, "reason", "exact_source_range_duplicate"),
+                        getattr(item, "containment", None),
+                        getattr(item, "iou", None),
+                        source_fcpxml,
+                        output_fcpxml,
+                        now,
+                    ),
+                )
+                count += 1
+        return count
+
+    def review_dedupe_removed_ids(self, stockify_run_id: str) -> set[str]:
+        with self.database.connect() as connection:
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT removed_stock_clip_id
+                    FROM review_dedupe_removals
+                    WHERE stockify_run_id=?
+                    """,
+                    (stockify_run_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return set()
+        return {str(row["removed_stock_clip_id"]) for row in rows}
+
+    def record_review_global_dedupe_removals(
+        self,
+        *,
+        removals: Iterable[Any],
+    ) -> int:
+        """Persist cross-shard global dedupe suppressions (idempotent upsert)."""
+        now = utc_now()
+        count = 0
+        with self.database.transaction() as connection:
+            for item in removals:
+                removal_id = stable_id(
+                    "GDEDUPE",
+                    getattr(item, "stockify_run_id"),
+                    getattr(item, "removed_stock_clip_id"),
+                )
+                provenance = getattr(item, "provenance", None)
+                if provenance is None:
+                    provenance = {}
+                connection.execute(
+                    """
+                    INSERT INTO review_global_dedupe_removals(
+                        id, stockify_run_id, removed_stock_clip_id,
+                        canonical_stock_clip_id, cluster_id, cluster_type,
+                        source_media, canonical_source_start, canonical_source_duration,
+                        reason, containment, iou, source_shard,
+                        removed_project_name, kept_project_name, provenance_json,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(stockify_run_id, removed_stock_clip_id) DO UPDATE SET
+                        canonical_stock_clip_id=excluded.canonical_stock_clip_id,
+                        cluster_id=excluded.cluster_id,
+                        cluster_type=excluded.cluster_type,
+                        source_media=excluded.source_media,
+                        canonical_source_start=excluded.canonical_source_start,
+                        canonical_source_duration=excluded.canonical_source_duration,
+                        reason=excluded.reason,
+                        containment=excluded.containment,
+                        iou=excluded.iou,
+                        source_shard=excluded.source_shard,
+                        removed_project_name=excluded.removed_project_name,
+                        kept_project_name=excluded.kept_project_name,
+                        provenance_json=excluded.provenance_json,
+                        created_at=excluded.created_at
+                    """,
+                    (
+                        removal_id,
+                        getattr(item, "stockify_run_id"),
+                        getattr(item, "removed_stock_clip_id"),
+                        getattr(item, "canonical_stock_clip_id"),
+                        getattr(item, "cluster_id"),
+                        getattr(item, "cluster_type"),
+                        getattr(item, "source_media", None),
+                        getattr(item, "canonical_source_start", None),
+                        getattr(item, "canonical_source_duration", None),
+                        getattr(item, "reason"),
+                        getattr(item, "containment", None),
+                        getattr(item, "iou", None),
+                        getattr(item, "source_shard", None),
+                        getattr(item, "removed_project_name", None),
+                        getattr(item, "kept_project_name", None),
+                        json_dumps(provenance),
+                        now,
+                    ),
+                )
+                count += 1
+        return count
+
+    def review_global_dedupe_removed_ids(self, stockify_run_id: str) -> set[str]:
+        with self.database.connect() as connection:
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT removed_stock_clip_id
+                    FROM review_global_dedupe_removals
+                    WHERE stockify_run_id=?
+                    """,
+                    (stockify_run_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return set()
+        return {str(row["removed_stock_clip_id"]) for row in rows}
+
+    def record_review_short_prune_removals(
+        self,
+        *,
+        removals: Iterable[Any],
+    ) -> int:
+        """Persist short-candidate prune suppressions (idempotent upsert)."""
+        now = utc_now()
+        count = 0
+        with self.database.transaction() as connection:
+            for item in removals:
+                removal_id = stable_id(
+                    "SPRUNE",
+                    getattr(item, "stockify_run_id"),
+                    getattr(item, "removed_stock_clip_id"),
+                )
+                provenance = getattr(item, "provenance", None) or {}
+                connection.execute(
+                    """
+                    INSERT INTO review_short_prune_removals(
+                        id, stockify_run_id, removed_stock_clip_id,
+                        removed_project_name, reason, effective_duration_seconds,
+                        min_duration_seconds, candidate_tier, short_clip_recovery,
+                        source_shard, input_xml, output_xml, provenance_json,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(stockify_run_id, removed_stock_clip_id) DO UPDATE SET
+                        removed_project_name=excluded.removed_project_name,
+                        reason=excluded.reason,
+                        effective_duration_seconds=excluded.effective_duration_seconds,
+                        min_duration_seconds=excluded.min_duration_seconds,
+                        candidate_tier=excluded.candidate_tier,
+                        short_clip_recovery=excluded.short_clip_recovery,
+                        source_shard=excluded.source_shard,
+                        input_xml=excluded.input_xml,
+                        output_xml=excluded.output_xml,
+                        provenance_json=excluded.provenance_json,
+                        created_at=excluded.created_at
+                    """,
+                    (
+                        removal_id,
+                        getattr(item, "stockify_run_id"),
+                        getattr(item, "removed_stock_clip_id"),
+                        getattr(item, "removed_project_name", None),
+                        getattr(item, "reason"),
+                        getattr(item, "effective_duration_seconds"),
+                        getattr(item, "min_duration_seconds"),
+                        getattr(item, "candidate_tier", None),
+                        getattr(item, "short_clip_recovery", None),
+                        getattr(item, "source_shard", None),
+                        getattr(item, "input_xml", None),
+                        getattr(item, "output_xml", None),
+                        json_dumps(provenance),
+                        now,
+                    ),
+                )
+                count += 1
+        return count
+
+    def review_short_prune_removed_ids(self, stockify_run_id: str) -> set[str]:
+        with self.database.connect() as connection:
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT removed_stock_clip_id
+                    FROM review_short_prune_removals
+                    WHERE stockify_run_id=?
+                    """,
+                    (stockify_run_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return set()
+        return {str(row["removed_stock_clip_id"]) for row in rows}
+
+    def all_pre_review_dedupe_removed_ids(self, stockify_run_id: str) -> set[str]:
+        """Union of pre-review suppressions (dedupe + short prune)."""
+        return (
+            self.review_dedupe_removed_ids(stockify_run_id)
+            | self.review_global_dedupe_removed_ids(stockify_run_id)
+            | self.review_short_prune_removed_ids(stockify_run_id)
+        )
+
+    def record_review_location_recoveries(
+        self,
+        *,
+        recoveries: Iterable[Any],
+    ) -> int:
+        """Persist review-shard location recovery provenance (idempotent upsert)."""
+        now = utc_now()
+        count = 0
+        with self.database.transaction() as connection:
+            for item in recoveries:
+                recovery_id = stable_id(
+                    "LRECV",
+                    getattr(item, "stockify_run_id"),
+                    getattr(item, "stock_clip_id"),
+                )
+                provenance = getattr(item, "provenance", None) or {}
+                srt_paths = getattr(item, "srt_paths", None) or []
+                connection.execute(
+                    """
+                    INSERT INTO review_location_recoveries(
+                        id, stockify_run_id, stock_clip_id,
+                        original_event_name, new_event_name,
+                        original_project_name, new_project_name,
+                        source_media, srt_paths_json,
+                        representative_lat, representative_lon,
+                        resolution_confidence, recovery_reason,
+                        source_shard, input_xml, output_xml,
+                        provenance_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(stockify_run_id, stock_clip_id) DO UPDATE SET
+                        original_event_name=excluded.original_event_name,
+                        new_event_name=excluded.new_event_name,
+                        original_project_name=excluded.original_project_name,
+                        new_project_name=excluded.new_project_name,
+                        source_media=excluded.source_media,
+                        srt_paths_json=excluded.srt_paths_json,
+                        representative_lat=excluded.representative_lat,
+                        representative_lon=excluded.representative_lon,
+                        resolution_confidence=excluded.resolution_confidence,
+                        recovery_reason=excluded.recovery_reason,
+                        source_shard=excluded.source_shard,
+                        input_xml=excluded.input_xml,
+                        output_xml=excluded.output_xml,
+                        provenance_json=excluded.provenance_json,
+                        created_at=excluded.created_at
+                    """,
+                    (
+                        recovery_id,
+                        getattr(item, "stockify_run_id"),
+                        getattr(item, "stock_clip_id"),
+                        getattr(item, "original_event_name", None),
+                        getattr(item, "new_event_name", None),
+                        getattr(item, "original_project_name", None),
+                        getattr(item, "new_project_name", None),
+                        getattr(item, "source_media", None),
+                        json_dumps(list(srt_paths)),
+                        getattr(item, "representative_lat", None),
+                        getattr(item, "representative_lon", None),
+                        getattr(item, "resolution_confidence"),
+                        getattr(item, "recovery_reason"),
+                        getattr(item, "source_shard", None),
+                        getattr(item, "input_xml", None),
+                        getattr(item, "output_xml", None),
+                        json_dumps(provenance),
+                        now,
+                    ),
+                )
+                count += 1
+        return count
+
+    def review_location_recovered_ids(self, stockify_run_id: str) -> set[str]:
+        with self.database.connect() as connection:
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT stock_clip_id
+                    FROM review_location_recoveries
+                    WHERE stockify_run_id=?
+                    """,
+                    (stockify_run_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return set()
+        return {str(row["stock_clip_id"]) for row in rows}
+
+    def record_review_color_repairs(
+        self,
+        *,
+        repairs: Iterable[Any],
+    ) -> int:
+        """Persist Camera LUT repair provenance (idempotent upsert)."""
+        now = utc_now()
+        count = 0
+        with self.database.transaction() as connection:
+            for item in repairs:
+                repair_id = stable_id(
+                    "CREPAIR",
+                    getattr(item, "stockify_run_id"),
+                    getattr(item, "stock_clip_id"),
+                )
+                provenance = getattr(item, "provenance", None) or {}
+                connection.execute(
+                    """
+                    INSERT INTO review_color_repairs(
+                        id, stockify_run_id, stock_clip_id,
+                        source_media, camera_model, color_md,
+                        previous_camera_lut, new_camera_lut,
+                        previous_xml_lut_identity, new_xml_lut_identity,
+                        previous_effect_signature, new_effect_signature,
+                        repair_reason, source_shard, project_name,
+                        input_xml, output_xml, srt_path,
+                        provenance_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(stockify_run_id, stock_clip_id) DO UPDATE SET
+                        source_media=excluded.source_media,
+                        camera_model=excluded.camera_model,
+                        color_md=excluded.color_md,
+                        previous_camera_lut=excluded.previous_camera_lut,
+                        new_camera_lut=excluded.new_camera_lut,
+                        previous_xml_lut_identity=excluded.previous_xml_lut_identity,
+                        new_xml_lut_identity=excluded.new_xml_lut_identity,
+                        previous_effect_signature=excluded.previous_effect_signature,
+                        new_effect_signature=excluded.new_effect_signature,
+                        repair_reason=excluded.repair_reason,
+                        source_shard=excluded.source_shard,
+                        project_name=excluded.project_name,
+                        input_xml=excluded.input_xml,
+                        output_xml=excluded.output_xml,
+                        srt_path=excluded.srt_path,
+                        provenance_json=excluded.provenance_json,
+                        created_at=excluded.created_at
+                    """,
+                    (
+                        repair_id,
+                        getattr(item, "stockify_run_id"),
+                        getattr(item, "stock_clip_id"),
+                        getattr(item, "source_media", None),
+                        getattr(item, "camera_model", None),
+                        getattr(item, "color_md", None),
+                        getattr(item, "previous_camera_lut", None),
+                        getattr(item, "new_camera_lut", None),
+                        getattr(item, "previous_xml_lut_identity", None),
+                        getattr(item, "new_xml_lut_identity", None),
+                        getattr(item, "previous_effect_signature", None),
+                        getattr(item, "new_effect_signature", None),
+                        getattr(item, "repair_reason"),
+                        getattr(item, "source_shard", None),
+                        getattr(item, "project_name", None),
+                        getattr(item, "input_xml", None),
+                        getattr(item, "output_xml", None),
+                        getattr(item, "srt_path", None),
+                        json_dumps(provenance),
+                        now,
+                    ),
+                )
+                count += 1
+        return count
+
+    def review_color_repaired_ids(self, stockify_run_id: str) -> set[str]:
+        with self.database.connect() as connection:
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT stock_clip_id
+                    FROM review_color_repairs
+                    WHERE stockify_run_id=?
+                    """,
+                    (stockify_run_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return set()
+        return {str(row["stock_clip_id"]) for row in rows}

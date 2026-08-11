@@ -155,6 +155,47 @@ class CatalogRepository:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def libraries_for_stockify_run(self, run_id: str) -> list[dict[str, Any]]:
+        """Return processed FCP libraries associated with a Stockify run."""
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM processed_libraries
+                WHERE first_stockify_run_id=? OR last_stockify_run_id=?
+                ORDER BY lower(library_name), library_path
+                """,
+                (run_id, run_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def source_media_for_stems(
+        self,
+        run_id: str,
+        stems: Iterable[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Load source_media rows keyed by normalized_stem for a run."""
+        normalized = sorted({str(stem).casefold() for stem in stems if stem})
+        if not normalized:
+            return {}
+        placeholders = ", ".join("?" for _ in normalized)
+        query = f"""
+            SELECT *
+            FROM source_media
+            WHERE run_id=?
+              AND lower(normalized_stem) IN ({placeholders})
+        """
+        with self.database.connect() as connection:
+            rows = connection.execute(query, [run_id, *normalized]).fetchall()
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            item = dict(row)
+            item["location"] = json_loads(item.pop("location_json"), {})
+            stem = str(item.get("normalized_stem") or "").casefold()
+            if stem:
+                result[stem] = item
+        return result
+
     def fail_stockify_run(self, run_id: str, error_text: str) -> None:
         with self.database.transaction() as connection:
             connection.execute(
@@ -390,6 +431,100 @@ class CatalogRepository:
         if not rows:
             raise VClipError(f"Unknown stock candidate {stock_clip_id} in run {run_id}.")
         return rows[0]
+
+    def candidates_by_ids(self, stock_clip_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+        """Load accepted candidates by stock_clip_id across runs."""
+        ids = sorted({str(value) for value in stock_clip_ids if value})
+        if not ids:
+            return {}
+        placeholders = ", ".join("?" for _ in ids)
+        query = f"""
+            SELECT
+                c.*,
+                p.source_name AS source_project_name,
+                p.source_event_id,
+                p.source_index AS source_project_index,
+                e.source_name AS source_event_name,
+                s.capture_date AS session_capture_date,
+                s.captured_at_local AS session_captured_at_local,
+                s.timezone AS session_timezone,
+                s.country AS session_country,
+                s.state AS session_state,
+                s.city AS session_city,
+                s.neighborhood AS session_neighborhood,
+                s.public_label AS session_public_label,
+                m.original_filename AS source_filename,
+                m.media_path AS source_media_path,
+                m.normalized_stem AS source_normalized_stem,
+                m.fps AS source_fps
+            FROM stock_candidates c
+            JOIN source_projects p ON p.id=c.source_project_id
+            JOIN source_events e ON e.id=p.source_event_id
+            LEFT JOIN shoot_sessions s ON s.id=c.session_id
+            LEFT JOIN source_media m ON m.id=c.source_media_id
+            WHERE c.eligibility_status='accepted'
+              AND c.stock_clip_id IN ({placeholders})
+        """
+        with self.database.connect() as connection:
+            rows = connection.execute(query, ids).fetchall()
+        return {
+            str(row["stock_clip_id"]): self._decode_candidate_row(dict(row))
+            for row in rows
+        }
+
+    def candidates_by_run_and_ids(
+        self,
+        pairs: Iterable[tuple[str, str]],
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        """Load accepted candidates keyed by (run_id, stock_clip_id)."""
+        unique_pairs = sorted(
+            {
+                (str(run_id), str(clip_id))
+                for run_id, clip_id in pairs
+                if run_id and clip_id
+            }
+        )
+        if not unique_pairs:
+            return {}
+        placeholders = ", ".join("(?, ?)" for _ in unique_pairs)
+        parameters: list[Any] = []
+        for run_id, clip_id in unique_pairs:
+            parameters.extend([run_id, clip_id])
+        query = f"""
+            SELECT
+                c.*,
+                p.source_name AS source_project_name,
+                p.source_event_id,
+                p.source_index AS source_project_index,
+                e.source_name AS source_event_name,
+                s.capture_date AS session_capture_date,
+                s.captured_at_local AS session_captured_at_local,
+                s.timezone AS session_timezone,
+                s.country AS session_country,
+                s.state AS session_state,
+                s.city AS session_city,
+                s.neighborhood AS session_neighborhood,
+                s.public_label AS session_public_label,
+                m.original_filename AS source_filename,
+                m.media_path AS source_media_path,
+                m.normalized_stem AS source_normalized_stem,
+                m.fps AS source_fps
+            FROM stock_candidates c
+            JOIN source_projects p ON p.id=c.source_project_id
+            JOIN source_events e ON e.id=p.source_event_id
+            LEFT JOIN shoot_sessions s ON s.id=c.session_id
+            LEFT JOIN source_media m ON m.id=c.source_media_id
+            WHERE c.eligibility_status='accepted'
+              AND (c.run_id, c.stock_clip_id) IN ({placeholders})
+        """
+        with self.database.connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return {
+            (str(row["run_id"]), str(row["stock_clip_id"])): self._decode_candidate_row(
+                dict(row)
+            )
+            for row in rows
+        }
 
     @staticmethod
     def _decode_candidate_row(row: dict[str, Any]) -> dict[str, Any]:

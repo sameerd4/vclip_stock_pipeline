@@ -186,6 +186,7 @@ class ReconcileService:
             candidates_by_project: dict[str, list[dict[str, Any]]] = defaultdict(list)
             for candidate in candidates:
                 candidates_by_project[str(candidate["source_project_id"])].append(candidate)
+            dedupe_removed_ids = self._review_dedupe_removed_ids(resolved_run_id)
 
             decisions: list[dict[str, Any]] = []
             for source_project_id, project_candidates in candidates_by_project.items():
@@ -203,9 +204,15 @@ class ReconcileService:
                     for candidate in project_candidates
                 )
                 for candidate in project_candidates:
-                    candidate_occurrences = occurrences_by_id.get(
-                        str(candidate["stock_clip_id"]), []
-                    )
+                    clip_id = str(candidate["stock_clip_id"])
+                    # Exact-duplicate projects removed by review-dedupe stay
+                    # out-of-scope / not observed — never auto-rejected.
+                    if clip_id in dedupe_removed_ids and not occurrences_by_id.get(
+                        clip_id
+                    ):
+                        report.out_of_scope += 1
+                        continue
+                    candidate_occurrences = occurrences_by_id.get(clip_id, [])
                     individual_name = str(
                         candidate.get("generated_clip_project_name") or ""
                     )
@@ -217,7 +224,6 @@ class ReconcileService:
                     ):
                         report.out_of_scope += 1
                         continue
-                    clip_id = str(candidate["stock_clip_id"])
                     decision = self._decide(
                         candidate=candidate,
                         reviewed=candidate_occurrences,
@@ -410,6 +416,16 @@ class ReconcileService:
                 "The reviewed XML contains candidates from multiple Stockify runs."
             )
         return str(self.repository.latest_stockify_run()["id"])
+
+    def _review_dedupe_removed_ids(self, run_id: str) -> set[str]:
+        """Clip IDs removed by pre-review dedupe or short-candidate prune."""
+        try:
+            from ..workflow.catalog import WorkflowCatalog
+        except ImportError:
+            return set()
+        return WorkflowCatalog(
+            self.repository.database
+        ).all_pre_review_dedupe_removed_ids(run_id)
 
     @staticmethod
     def _project_scope(
