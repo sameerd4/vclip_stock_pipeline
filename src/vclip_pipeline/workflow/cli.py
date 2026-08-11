@@ -23,6 +23,26 @@ from .entities import EntityCatalog
 from .export_ingest import ExportIngestService
 from .frames import FrameSampler
 from .providers import OpenAIVisualAnalyzer
+from .review_dedupe import ReviewDedupeService, format_text_report
+from .review_dedupe_batch import ReviewDedupeBatchService, format_batch_text_report
+from .review_dedupe_global import ReviewGlobalDedupeService, format_global_text_report
+from .review_color_integrity import (
+    ReviewColorIntegrityService,
+    format_color_integrity_text,
+)
+from .review_color_repair import (
+    ReviewColorRepairService,
+    format_color_repair_text,
+)
+from .review_location_materialize import (
+    ReviewLocationMaterializeService,
+    format_materialize_plan_text,
+)
+from .review_location_recover import (
+    ReviewLocationRecoverService,
+    format_location_recover_text,
+)
+from .review_prune import ReviewPruneService, format_prune_text_report
 from .review_shard import ReviewShardService
 from .taxonomy import VisualTaxonomy
 
@@ -105,6 +125,281 @@ def build_parser() -> argparse.ArgumentParser:
     shard.add_argument("--report", type=Path)
     shard.add_argument("--quiet", action="store_true")
     shard.set_defaults(handler=_run_review_shard)
+
+    dedupe = sub.add_parser(
+        "review-dedupe",
+        help=(
+            "Remove exact source-range duplicate projects from a review shard "
+            "FCPXML without rerunning Stockify."
+        ),
+    )
+    dedupe.add_argument("input_xml", type=Path)
+    dedupe.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    dedupe.add_argument("--output", type=Path, required=True)
+    dedupe.add_argument("--report", type=Path, required=True)
+    dedupe.add_argument("--text-report", type=Path, required=True)
+    dedupe.add_argument(
+        "--manifest",
+        type=Path,
+        help="Optional shard manifest; defaults to <input>-shard-manifest.json.",
+    )
+    dedupe.add_argument("--overwrite", action="store_true")
+    dedupe.add_argument("--dry-run", action="store_true")
+    dedupe.add_argument("--quiet", action="store_true")
+    dedupe.set_defaults(handler=_run_review_dedupe)
+
+    dedupe_batch = sub.add_parser(
+        "review-dedupe-batch",
+        help=(
+            "Bulk exact source-range duplicate removal across a review-shard "
+            "corpus, preferring portable XML with manifests from a separate root."
+        ),
+    )
+    dedupe_batch.add_argument("--input-root", type=Path, required=True)
+    dedupe_batch.add_argument("--manifest-root", type=Path, required=True)
+    dedupe_batch.add_argument("--output-root", type=Path, required=True)
+    dedupe_batch.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    dedupe_batch.add_argument("--report", type=Path, required=True)
+    dedupe_batch.add_argument("--text-report", type=Path, required=True)
+    dedupe_batch.add_argument(
+        "--near-policy",
+        choices=("none", "aggressive"),
+        default="none",
+        help=(
+            "none: exact dedupe only (default). "
+            "aggressive: also remove near-duplicates with containment>=0.95 and IoU>=0.92."
+        ),
+    )
+    dedupe_batch.add_argument("--overwrite", action="store_true")
+    dedupe_batch.add_argument("--dry-run", action="store_true")
+    dedupe_batch.add_argument("--quiet", action="store_true")
+    dedupe_batch.set_defaults(handler=_run_review_dedupe_batch)
+
+    dedupe_global = sub.add_parser(
+        "review-dedupe-global",
+        help=(
+            "Remove duplicate candidate representations across clean shard "
+            "boundaries, keeping one canonical stock candidate per source-range asset."
+        ),
+    )
+    dedupe_global.add_argument("--input-root", type=Path, required=True)
+    dedupe_global.add_argument("--output-root", type=Path, required=True)
+    dedupe_global.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    dedupe_global.add_argument("--report", type=Path, required=True)
+    dedupe_global.add_argument("--text-report", type=Path, required=True)
+    dedupe_global.add_argument("--conflict-report", type=Path, required=True)
+    dedupe_global.add_argument(
+        "--near-policy",
+        choices=("none", "aggressive"),
+        default="none",
+        help=(
+            "none: exact cross-shard dedupe only (default). "
+            "aggressive: also collapse cross-shard near-duplicates."
+        ),
+    )
+    dedupe_global.add_argument("--overwrite", action="store_true")
+    dedupe_global.add_argument("--dry-run", action="store_true")
+    dedupe_global.add_argument("--quiet", action="store_true")
+    dedupe_global.set_defaults(handler=_run_review_dedupe_global)
+
+    prune = sub.add_parser(
+        "review-prune",
+        help=(
+            "Remove unusably short individual stock candidates from a canonical "
+            "review shard corpus."
+        ),
+    )
+    prune.add_argument("--input-root", type=Path, required=True)
+    prune.add_argument("--output-root", type=Path, required=True)
+    prune.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    prune.add_argument(
+        "--min-duration",
+        type=_positive_float,
+        default=3.0,
+        help="Remove candidates with effective duration strictly below this value (seconds).",
+    )
+    prune.add_argument("--report", type=Path, required=True)
+    prune.add_argument("--text-report", type=Path, required=True)
+    prune.add_argument("--overwrite", action="store_true")
+    prune.add_argument("--dry-run", action="store_true")
+    prune.add_argument("--quiet", action="store_true")
+    prune.set_defaults(handler=_run_review_prune)
+
+    color_integrity = sub.add_parser(
+        "review-color-integrity",
+        help=(
+            "Read-only audit of Custom LUT / effect presence across a final "
+            "review shard corpus versus DB camera_lut metadata, with optional "
+            "SRT color_md D-Log M Camera LUT integrity analysis."
+        ),
+    )
+    color_integrity.add_argument("--input-root", type=Path, required=True)
+    color_integrity.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    color_integrity.add_argument("--report", type=Path, required=True)
+    color_integrity.add_argument("--text-report", type=Path, required=True)
+    color_integrity.add_argument(
+        "--csv-report",
+        type=Path,
+        help="Optional CSV path for definitive color_md=dlog_m candidate rows.",
+    )
+    color_integrity.add_argument(
+        "--media-root",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "Media/SRT root to scan for color_md (repeatable). Required for the "
+            "D-Log M Camera LUT integrity section."
+        ),
+    )
+    color_integrity.add_argument("--quiet", action="store_true")
+    color_integrity.set_defaults(handler=_run_review_color_integrity)
+
+    color_repair = sub.add_parser(
+        "review-color-repair",
+        help=(
+            "Repair the confirmed Mini 5 Pro ← Air 3 wrong Camera LUT cohort "
+            "in a review shard corpus (color_md=dlog_m only)."
+        ),
+    )
+    color_repair.add_argument("--input-root", type=Path, required=True)
+    color_repair.add_argument("--output-root", type=Path, required=True)
+    color_repair.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    color_repair.add_argument(
+        "--media-root",
+        type=Path,
+        action="append",
+        required=True,
+        help="Media/SRT root to scan for color_md (repeatable).",
+    )
+    color_repair.add_argument("--report", type=Path, required=True)
+    color_repair.add_argument("--text-report", type=Path, required=True)
+    color_repair.add_argument("--overwrite", action="store_true")
+    color_repair.add_argument("--dry-run", action="store_true")
+    color_repair.add_argument("--quiet", action="store_true")
+    color_repair.set_defaults(handler=_run_review_color_repair)
+
+    locate = sub.add_parser(
+        "review-location-recover",
+        help=(
+            "Recover Unknown Location labels in a final review shard corpus "
+            "from SRT GPS under explicit media roots. Optional "
+            "--forensic-jpg-exif runs a read-only JPG EXIF same-shoot pass."
+        ),
+    )
+    locate.add_argument("--input-root", type=Path, required=True)
+    locate.add_argument(
+        "--output-root",
+        type=Path,
+        help="Required unless --forensic-jpg-exif (read-only forensic mode).",
+    )
+    locate.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    locate.add_argument(
+        "--media-root",
+        type=Path,
+        action="append",
+        required=True,
+        help=(
+            "Media/SRT/JPG root to scan (repeatable). Scanned once for .SRT "
+            "and, in forensic mode, nearby .JPG/.JPEG stills."
+        ),
+    )
+    locate.add_argument("--report", type=Path, required=True)
+    locate.add_argument("--text-report", type=Path, required=True)
+    locate.add_argument(
+        "--forensic-jpg-exif",
+        action="store_true",
+        help=(
+            "Read-only forensic mode: for Unknown sources lacking usable SRT "
+            "GPS, correlate nearby DJI JPG/JPEG EXIF GPS as jpg_exif_same_shoot "
+            "evidence. Does not mutate XML or DB."
+        ),
+    )
+    locate.add_argument(
+        "--places-file",
+        type=Path,
+        help="Optional local places catalog JSON (defaults to bundled places.json).",
+    )
+    locate.add_argument(
+        "--location-provider",
+        choices=("catalog", "catalog+nominatim"),
+        default="catalog",
+    )
+    locate.add_argument("--nominatim-user-agent")
+    locate.add_argument(
+        "--location-overrides",
+        type=Path,
+        help=(
+            "JSON file of geographic-cluster overrides keyed by cluster_id or "
+            "original_event + representative GPS. Applies only to clusters with "
+            "valid recovered GPS."
+        ),
+    )
+    locate.add_argument("--overwrite", action="store_true")
+    locate.add_argument("--dry-run", action="store_true")
+    locate.add_argument("--quiet", action="store_true")
+    locate.set_defaults(handler=_run_review_location_recover)
+
+    materialize = sub.add_parser(
+        "review-location-materialize",
+        help=(
+            "Materialize persisted JPG EXIF / editorial-group forensic location "
+            "knowledge into a new shard root without remounting media."
+        ),
+    )
+    materialize.add_argument("--input-root", type=Path, required=True)
+    materialize.add_argument("--output-root", type=Path, required=True)
+    materialize.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    materialize.add_argument(
+        "--forensic-json",
+        type=Path,
+        required=True,
+        help="Persisted jpg-exif-forensic.json report to consume.",
+    )
+    materialize.add_argument(
+        "--projected-coverage-json",
+        type=Path,
+        help="Optional projected-drone-location-coverage.json for cross-checks.",
+    )
+    materialize.add_argument(
+        "--plan-json",
+        type=Path,
+        required=True,
+        help="Write location-materialization-plan.json here.",
+    )
+    materialize.add_argument(
+        "--plan-text",
+        type=Path,
+        required=True,
+        help="Write location-materialization-plan.txt here.",
+    )
+    materialize.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=True,
+        help="Plan and audit only; do not write the output shard root or DB (default).",
+    )
+    materialize.add_argument(
+        "--write",
+        action="store_true",
+        help="Actually write the output shard root and persist DB updates.",
+    )
+    materialize.add_argument("--overwrite", action="store_true")
+    materialize.add_argument(
+        "--skip-color-integrity",
+        action="store_true",
+        help="Skip the read-only color-integrity check during dry-run/write.",
+    )
+    materialize.add_argument(
+        "--refresh-audit",
+        action="store_true",
+        help=(
+            "Rebuild the materialization plan/audit against an already-written "
+            "output root without mutating XML or DB."
+        ),
+    )
+    materialize.add_argument("--quiet", action="store_true")
+    materialize.set_defaults(handler=_run_review_location_materialize)
 
     ingest = sub.add_parser(
         "exports-ingest",
@@ -256,6 +551,243 @@ def _run_review_shard(args: argparse.Namespace) -> int:
     print(f"Output:           {result.output_directory}")
     print(f"Report:           {report_path}")
     return 0
+
+
+def _run_review_dedupe(args: argparse.Namespace) -> int:
+    repository, workflow = _catalog(args.db)
+    report = ReviewDedupeService(
+        repository,
+        workflow,
+        progress=_progress(args.quiet),
+    ).run(
+        input_xml=args.input_xml.expanduser().resolve(),
+        output_xml=args.output.expanduser().resolve(),
+        report_path=args.report.expanduser().resolve(),
+        text_report_path=args.text_report.expanduser().resolve(),
+        manifest_path=(
+            args.manifest.expanduser().resolve() if args.manifest else None
+        ),
+        dry_run=args.dry_run,
+        overwrite=args.overwrite,
+    )
+    print()
+    print(format_text_report(report).rstrip())
+    print(f"JSON report: {args.report}")
+    print(f"Text report: {args.text_report}")
+    return 0
+
+
+def _run_review_dedupe_batch(args: argparse.Namespace) -> int:
+    repository, workflow = _catalog(args.db)
+    report = ReviewDedupeBatchService(
+        repository,
+        workflow,
+        progress=_progress(args.quiet),
+    ).run(
+        input_root=args.input_root.expanduser().resolve(),
+        manifest_root=args.manifest_root.expanduser().resolve(),
+        output_root=args.output_root.expanduser().resolve(),
+        report_path=args.report.expanduser().resolve(),
+        text_report_path=args.text_report.expanduser().resolve(),
+        dry_run=args.dry_run,
+        overwrite=args.overwrite,
+        near_policy=args.near_policy,
+    )
+    print()
+    print(format_batch_text_report(report).rstrip())
+    print(f"JSON report: {args.report}")
+    print(f"Text report: {args.text_report}")
+    return 1 if report.shards_failed else 0
+
+
+def _run_review_dedupe_global(args: argparse.Namespace) -> int:
+    repository, workflow = _catalog(args.db)
+    report = ReviewGlobalDedupeService(
+        repository,
+        workflow,
+        progress=_progress(args.quiet),
+    ).run(
+        input_root=args.input_root.expanduser().resolve(),
+        output_root=args.output_root.expanduser().resolve(),
+        report_path=args.report.expanduser().resolve(),
+        text_report_path=args.text_report.expanduser().resolve(),
+        conflict_report_path=args.conflict_report.expanduser().resolve(),
+        near_policy=args.near_policy,
+        dry_run=args.dry_run,
+        overwrite=args.overwrite,
+    )
+    print()
+    print(format_global_text_report(report).rstrip())
+    print(f"JSON report:     {args.report}")
+    print(f"Text report:     {args.text_report}")
+    print(f"Conflict report: {args.conflict_report}")
+    return 1 if report.shards_failed else 0
+
+
+def _run_review_prune(args: argparse.Namespace) -> int:
+    repository, workflow = _catalog(args.db)
+    report = ReviewPruneService(
+        repository,
+        workflow,
+        progress=_progress(args.quiet),
+    ).run(
+        input_root=args.input_root.expanduser().resolve(),
+        output_root=args.output_root.expanduser().resolve(),
+        report_path=args.report.expanduser().resolve(),
+        text_report_path=args.text_report.expanduser().resolve(),
+        min_duration=args.min_duration,
+        dry_run=args.dry_run,
+        overwrite=args.overwrite,
+    )
+    print()
+    print(format_prune_text_report(report).rstrip())
+    print(f"JSON report: {args.report}")
+    print(f"Text report: {args.text_report}")
+    return 1 if report.shards_failed else 0
+
+
+def _run_review_color_integrity(args: argparse.Namespace) -> int:
+    repository, _workflow = _catalog(args.db)
+    report = ReviewColorIntegrityService(
+        repository,
+        progress=_progress(args.quiet),
+    ).run(
+        input_root=args.input_root.expanduser().resolve(),
+        report_path=args.report.expanduser().resolve(),
+        text_report_path=args.text_report.expanduser().resolve(),
+        media_roots=[path.expanduser().resolve() for path in (args.media_root or [])],
+        csv_report_path=(
+            args.csv_report.expanduser().resolve() if args.csv_report else None
+        ),
+    )
+    print()
+    print(format_color_integrity_text(report).rstrip())
+    print(f"JSON report: {args.report}")
+    print(f"Text report: {args.text_report}")
+    if report.csv_report_path:
+        print(f"CSV report:  {report.csv_report_path}")
+    if report.dlog_audit:
+        counts = report.dlog_audit.get("classification_counts") or {}
+        print(
+            "D-Log M audit: "
+            f"{report.dlog_audit.get('dlog_m_candidates', 0)} candidates, "
+            f"{counts.get('DLOG_CORRECT_CAMERA_LUT', 0)} correct, "
+            f"{counts.get('DLOG_NO_CAMERA_LUT', 0)} no camera LUT, "
+            f"{len(report.camera_lut_signatures)} distinct LUT signatures"
+        )
+    parse_failures = sum(
+        1 for item in report.failures if item.get("status") == "xml_parse_error"
+    )
+    return 1 if parse_failures else 0
+
+
+def _run_review_color_repair(args: argparse.Namespace) -> int:
+    repository, workflow = _catalog(args.db)
+    report = ReviewColorRepairService(
+        repository,
+        workflow,
+        progress=_progress(args.quiet),
+    ).run(
+        input_root=args.input_root.expanduser().resolve(),
+        output_root=args.output_root.expanduser().resolve(),
+        media_roots=[path.expanduser().resolve() for path in args.media_root],
+        report_path=args.report.expanduser().resolve(),
+        text_report_path=args.text_report.expanduser().resolve(),
+        dry_run=args.dry_run,
+        overwrite=args.overwrite,
+    )
+    print()
+    print(format_color_repair_text(report).rstrip())
+    print(f"JSON report: {args.report}")
+    print(f"Text report: {args.text_report}")
+    if report.post_write_audit:
+        print(
+            "Post-audit: "
+            f"still_wrong={report.post_write_audit.get('still_wrong_camera_lut')} "
+            f"db_xml_mismatches={report.post_write_audit.get('db_xml_mismatches')}"
+        )
+    return 1 if report.shards_failed else 0
+
+
+def _run_review_location_materialize(args: argparse.Namespace) -> int:
+    repository, workflow = _catalog(args.db)
+    dry_run = not bool(args.write)
+    if args.refresh_audit and args.write:
+        raise VClipError("--refresh-audit cannot be combined with --write")
+    report = ReviewLocationMaterializeService(
+        repository,
+        workflow,
+        progress=_progress(args.quiet),
+    ).run(
+        input_root=args.input_root.expanduser().resolve(),
+        output_root=args.output_root.expanduser().resolve(),
+        forensic_json=args.forensic_json.expanduser().resolve(),
+        projected_coverage_json=(
+            args.projected_coverage_json.expanduser().resolve()
+            if args.projected_coverage_json
+            else None
+        ),
+        plan_json=args.plan_json.expanduser().resolve(),
+        plan_text=args.plan_text.expanduser().resolve(),
+        dry_run=dry_run,
+        overwrite=bool(args.overwrite),
+        skip_color_integrity=bool(args.skip_color_integrity),
+        refresh_audit=bool(args.refresh_audit),
+    )
+    print()
+    print(format_materialize_plan_text(report).rstrip())
+    print(f"Plan JSON: {args.plan_json}")
+    print(f"Plan text: {args.plan_text}")
+    checks = report.dry_run_checks or {}
+    if (report.dry_run or args.refresh_audit) and not checks.get("all_passed"):
+        return 1
+    return 1 if report.shards_failed else 0
+
+
+def _run_review_location_recover(args: argparse.Namespace) -> int:
+    from ..geo import build_location_resolver, default_places_path
+
+    repository, workflow = _catalog(args.db)
+    places_path = (
+        args.places_file.expanduser().resolve()
+        if args.places_file
+        else default_places_path()
+    )
+    location_resolver = build_location_resolver(
+        repository,
+        places_path=places_path,
+        enable_nominatim=args.location_provider == "catalog+nominatim",
+        nominatim_user_agent_override=args.nominatim_user_agent,
+    )
+    if not args.forensic_jpg_exif and args.output_root is None:
+        raise VClipError("--output-root is required unless --forensic-jpg-exif")
+    report = ReviewLocationRecoverService(
+        repository,
+        location_resolver,
+        workflow,
+        progress=_progress(args.quiet),
+    ).run(
+        input_root=args.input_root.expanduser().resolve(),
+        output_root=(
+            args.output_root.expanduser().resolve() if args.output_root else None
+        ),
+        media_roots=[path.expanduser().resolve() for path in args.media_root],
+        report_path=args.report.expanduser().resolve(),
+        text_report_path=args.text_report.expanduser().resolve(),
+        dry_run=args.dry_run,
+        overwrite=args.overwrite,
+        location_overrides=(
+            args.location_overrides.expanduser().resolve()
+            if args.location_overrides
+            else None
+        ),
+        forensic_jpg_exif=bool(args.forensic_jpg_exif),
+    )
+    print()
+    print(format_location_recover_text(report).rstrip())
+    print(f"JSON report: {args.report}")
+    print(f"Text report: {args.text_report}")
+    return 1 if report.shards_failed else 0
 
 
 def _run_exports_ingest(args: argparse.Namespace) -> int:
