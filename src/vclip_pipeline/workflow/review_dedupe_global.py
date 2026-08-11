@@ -13,7 +13,6 @@ from typing import Any, Callable
 from ..db.repository import CatalogRepository
 from ..errors import VClipError
 from ..stockify.core import parse_time
-from ..stockify.fcpxml import validate_fcpxml
 from ..util import stable_id, utc_now
 from .catalog import WorkflowCatalog
 from .review_dedupe import (

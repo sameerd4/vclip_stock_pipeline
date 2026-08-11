@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -651,7 +651,6 @@ def _physical_label(event_name: str, row: dict[str, Any]) -> str | None:
 
 
 def _prefer_candidate(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
-    rank = {state: index for index, state in enumerate(PROJECTED_STATES)}
     # Prefer correction/recovery states over plain known/unresolved.
     priority = {
         "stale_location_requires_correction": 0,
