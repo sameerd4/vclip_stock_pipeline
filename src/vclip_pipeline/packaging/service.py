@@ -17,6 +17,7 @@ from ..util import (
     ensure_empty_directory,
     safe_filename,
     sha256_file,
+    export_stable_id,
     stable_id,
     unique_preserving_order,
     utc_now,
@@ -173,12 +174,7 @@ class PackageService:
                         f"{match.path.name}: exported duration {probe.duration_seconds:.3f}s "
                         f"differs from reviewed duration {float(expected_duration):.3f}s."
                     )
-            export_id = stable_id(
-                "EXPORT",
-                resolved_run_id,
-                match.stock_clip_id,
-                str(match.path.resolve()),
-            )
+            export_id = export_stable_id(resolved_run_id, match.stock_clip_id)
             detail = {
                 "id": export_id,
                 "stockify_run_id": resolved_run_id,
@@ -206,14 +202,18 @@ class PackageService:
             )
 
         if not dry_run:
-            for detail in export_details.values():
-                self.repository.upsert_export(
+            for clip_id, detail in list(export_details.items()):
+                stored = self.repository.upsert_export(
                     {
                         key: value
                         for key, value in detail.items()
                         if key not in {"probe", "path"}
                     }
                 )
+                # Prefer durable canonical id (preserves legacy path-derived ids).
+                detail["id"] = stored["id"]
+                detail["exported_path"] = stored["exported_path"]
+                export_details[clip_id] = detail
 
         if match_result.missing_candidate_ids and not dry_run:
             self.repository.mark_missing_exports(
