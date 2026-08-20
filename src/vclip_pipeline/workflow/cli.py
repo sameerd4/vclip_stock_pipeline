@@ -11,7 +11,7 @@ from pathlib import Path
 
 from ..db import CatalogRepository, Database
 from ..errors import VClipError
-from ..publishing import PackageReleaseService
+from ..publishing import ContentReadinessService, PackageReleaseService
 from .catalog import WorkflowCatalog
 from .catalog_quality import (
     CatalogQualityService,
@@ -540,6 +540,44 @@ def build_parser() -> argparse.ArgumentParser:
     release.add_argument("--overwrite", action="store_true")
     release.add_argument("--dry-run", action="store_true")
     release.set_defaults(handler=_run_publish_release)
+
+    content = publish_sub.add_parser(
+        "content",
+        help="Prepare and validate customer-safe metadata and human rights review.",
+    )
+    content_sub = content.add_subparsers(dest="content_command", required=True)
+    content_prepare = content_sub.add_parser(
+        "prepare",
+        help=(
+            "Write public-metadata.json and create/reconcile "
+            "internal/rights-review.json for an existing package release."
+        ),
+    )
+    content_prepare.add_argument("slug")
+    content_prepare.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    content_prepare.add_argument("--version", type=_positive_int)
+    content_prepare.add_argument(
+        "--release-root",
+        type=Path,
+        required=True,
+        help="Root directory that contains <slug>/v<version>/package-release.json.",
+    )
+    content_prepare.set_defaults(handler=_run_publish_content_prepare)
+
+    content_validate = content_sub.add_parser(
+        "validate",
+        help="Validate public metadata + rights review and write content-validation.json.",
+    )
+    content_validate.add_argument("slug")
+    content_validate.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    content_validate.add_argument("--version", type=_positive_int)
+    content_validate.add_argument(
+        "--release-root",
+        type=Path,
+        required=True,
+        help="Root directory that contains <slug>/v<version>/package-release.json.",
+    )
+    content_validate.set_defaults(handler=_run_publish_content_validate)
     return parser
 
 
@@ -1039,6 +1077,51 @@ def _run_publish_release(args: argparse.Namespace) -> int:
         print("Output:      (dry run — no files were written)")
     else:
         print(f"Output:      {manifest['manifest_path']}")
+    return 0
+
+
+def _run_publish_content_prepare(args: argparse.Namespace) -> int:
+    _, workflow = _catalog(args.db)
+    result = ContentReadinessService(workflow).prepare(
+        slug=args.slug,
+        version=args.version,
+        release_root=args.release_root,
+    )
+    print()
+    print("Package content prepared")
+    print("------------------------")
+    print(f"Collection:       {result['collection_slug']}")
+    print(f"Version:          {result['collection_version']}")
+    print(f"Clips:            {result['clip_count']}")
+    print(f"Public metadata:  {result['public_metadata_path']}")
+    print(f"Rights review:    {result['rights_review_path']}")
+    print(f"Status:           {result['status']}")
+    print(result["note"])
+    return 0
+
+
+def _run_publish_content_validate(args: argparse.Namespace) -> int:
+    _, workflow = _catalog(args.db)
+    result = ContentReadinessService(workflow).validate(
+        slug=args.slug,
+        version=args.version,
+        release_root=args.release_root,
+    )
+    print()
+    print("Package content validation")
+    print("--------------------------")
+    print(f"Collection:             {result['collection_slug']}")
+    print(f"Version:                {result['collection_version']}")
+    print(f"Clips:                  {result['clip_count']}")
+    print(f"Public metadata ready:  {result['public_metadata_ready']}")
+    print(f"Rights review ready:    {result['rights_review_ready']}")
+    print(f"Status:                 {result['status']}")
+    print(f"Report:                 {result['path']}")
+    if result["failures"]:
+        print("Failures:")
+        for item in result["failures"]:
+            print(f"  - {item}")
+        return 2
     return 0
 
 
