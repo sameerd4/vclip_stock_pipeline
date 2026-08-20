@@ -11,6 +11,7 @@ from pathlib import Path
 
 from ..db import CatalogRepository, Database
 from ..errors import VClipError
+from ..publishing import PackageReleaseService
 from .catalog import WorkflowCatalog
 from .catalog_quality import (
     CatalogQualityService,
@@ -23,9 +24,6 @@ from .entities import EntityCatalog
 from .export_ingest import ExportIngestService
 from .frames import FrameSampler
 from .providers import OpenAIVisualAnalyzer
-from .review_dedupe import ReviewDedupeService, format_text_report
-from .review_dedupe_batch import ReviewDedupeBatchService, format_batch_text_report
-from .review_dedupe_global import ReviewGlobalDedupeService, format_global_text_report
 from .review_color_integrity import (
     ReviewColorIntegrityService,
     format_color_integrity_text,
@@ -34,6 +32,9 @@ from .review_color_repair import (
     ReviewColorRepairService,
     format_color_repair_text,
 )
+from .review_dedupe import ReviewDedupeService, format_text_report
+from .review_dedupe_batch import ReviewDedupeBatchService, format_batch_text_report
+from .review_dedupe_global import ReviewGlobalDedupeService, format_global_text_report
 from .review_location_materialize import (
     ReviewLocationMaterializeService,
     format_materialize_plan_text,
@@ -99,9 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     shard.add_argument("review_xml", type=Path)
     shard.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
     shard.add_argument("--output", type=Path, required=True)
-    shard.add_argument(
-        "--group-by", choices=("market", "event", "none"), default="market"
-    )
+    shard.add_argument("--group-by", choices=("market", "event", "none"), default="market")
     shard.add_argument(
         "--representation",
         choices=("individual", "compilation", "both"),
@@ -521,6 +520,26 @@ def build_parser() -> argparse.ArgumentParser:
     materialize.add_argument("--overwrite", action="store_true")
     materialize.add_argument("--dry-run", action="store_true")
     materialize.set_defaults(handler=_run_collection_materialize)
+
+    publish_ns = sub.add_parser(
+        "publish",
+        help="Compile customer-facing package releases from frozen collections.",
+    )
+    publish_sub = publish_ns.add_subparsers(dest="publish_command", required=True)
+    release = publish_sub.add_parser(
+        "release",
+        help=(
+            "Validate masters and write package-release.json for a collection "
+            "version (no media copy)."
+        ),
+    )
+    release.add_argument("slug")
+    release.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    release.add_argument("--version", type=_positive_int)
+    release.add_argument("--output", type=Path, required=True)
+    release.add_argument("--overwrite", action="store_true")
+    release.add_argument("--dry-run", action="store_true")
+    release.set_defaults(handler=_run_publish_release)
     return parser
 
 
@@ -564,9 +583,7 @@ def _run_review_dedupe(args: argparse.Namespace) -> int:
         output_xml=args.output.expanduser().resolve(),
         report_path=args.report.expanduser().resolve(),
         text_report_path=args.text_report.expanduser().resolve(),
-        manifest_path=(
-            args.manifest.expanduser().resolve() if args.manifest else None
-        ),
+        manifest_path=(args.manifest.expanduser().resolve() if args.manifest else None),
         dry_run=args.dry_run,
         overwrite=args.overwrite,
     )
@@ -656,9 +673,7 @@ def _run_review_color_integrity(args: argparse.Namespace) -> int:
         report_path=args.report.expanduser().resolve(),
         text_report_path=args.text_report.expanduser().resolve(),
         media_roots=[path.expanduser().resolve() for path in (args.media_root or [])],
-        csv_report_path=(
-            args.csv_report.expanduser().resolve() if args.csv_report else None
-        ),
+        csv_report_path=(args.csv_report.expanduser().resolve() if args.csv_report else None),
     )
     print()
     print(format_color_integrity_text(report).rstrip())
@@ -675,9 +690,7 @@ def _run_review_color_integrity(args: argparse.Namespace) -> int:
             f"{counts.get('DLOG_NO_CAMERA_LUT', 0)} no camera LUT, "
             f"{len(report.camera_lut_signatures)} distinct LUT signatures"
         )
-    parse_failures = sum(
-        1 for item in report.failures if item.get("status") == "xml_parse_error"
-    )
+    parse_failures = sum(1 for item in report.failures if item.get("status") == "xml_parse_error")
     return 1 if parse_failures else 0
 
 
@@ -749,9 +762,7 @@ def _run_review_location_recover(args: argparse.Namespace) -> int:
 
     repository, workflow = _catalog(args.db)
     places_path = (
-        args.places_file.expanduser().resolve()
-        if args.places_file
-        else default_places_path()
+        args.places_file.expanduser().resolve() if args.places_file else default_places_path()
     )
     location_resolver = build_location_resolver(
         repository,
@@ -768,18 +779,14 @@ def _run_review_location_recover(args: argparse.Namespace) -> int:
         progress=_progress(args.quiet),
     ).run(
         input_root=args.input_root.expanduser().resolve(),
-        output_root=(
-            args.output_root.expanduser().resolve() if args.output_root else None
-        ),
+        output_root=(args.output_root.expanduser().resolve() if args.output_root else None),
         media_roots=[path.expanduser().resolve() for path in args.media_root],
         report_path=args.report.expanduser().resolve(),
         text_report_path=args.text_report.expanduser().resolve(),
         dry_run=args.dry_run,
         overwrite=args.overwrite,
         location_overrides=(
-            args.location_overrides.expanduser().resolve()
-            if args.location_overrides
-            else None
+            args.location_overrides.expanduser().resolve() if args.location_overrides else None
         ),
         forensic_jpg_exif=bool(args.forensic_jpg_exif),
     )
@@ -947,10 +954,7 @@ def _run_catalog_search(args: argparse.Namespace) -> int:
             for item in explanation.get("contributions", []):
                 points = item.get("points", 0.0)
                 detail = f" ({item['detail']})" if item.get("detail") else ""
-                print(
-                    f"    +{points:.1f}  {item.get('kind')}  "
-                    f"{item.get('label')}{detail}"
-                )
+                print(f"    +{points:.1f}  {item.get('kind')}  {item.get('label')}{detail}")
     print(f"\nResults: {len(rows)}")
     return 0
 
@@ -992,9 +996,7 @@ def _suggestion_from_path(path: Path) -> CollectionSuggestion:
 
 def _run_collection_publish(args: argparse.Namespace) -> int:
     _, workflow = _catalog(args.db)
-    result = CollectionService(workflow).publish(
-        _suggestion_from_path(args.suggestion)
-    )
+    result = CollectionService(workflow).publish(_suggestion_from_path(args.suggestion))
     print(json.dumps(result, indent=2))
     return 0
 
@@ -1011,6 +1013,32 @@ def _run_collection_materialize(args: argparse.Namespace) -> int:
     )
     print(f"Materialized {result['clip_count']} clip(s).")
     print(f"Output: {result['output_directory']}")
+    return 0
+
+
+def _run_publish_release(args: argparse.Namespace) -> int:
+    _, workflow = _catalog(args.db)
+    manifest = PackageReleaseService(workflow).build(
+        slug=args.slug,
+        version=args.version,
+        output_directory=args.output,
+        overwrite=args.overwrite,
+        dry_run=args.dry_run,
+    )
+    print()
+    print("Package release core ready")
+    print("--------------------------")
+    print(f"Package ID:  {manifest['package_id']}")
+    print(f"Collection:  {manifest['collection_slug']}")
+    print(f"Version:     {manifest['collection_version']}")
+    print(f"Clips:       {manifest['clip_count']}")
+    print(f"Duration:    {manifest['total_duration_seconds']}")
+    print(f"Size:        {manifest['total_size_bytes']}")
+    print(f"Status:      {manifest['status']}")
+    if args.dry_run:
+        print("Output:      (dry run — no files were written)")
+    else:
+        print(f"Output:      {manifest['manifest_path']}")
     return 0
 
 
