@@ -301,3 +301,101 @@ def test_material_export_duration_mismatch_is_blocked(pipeline_run, monkeypatch)
             dry_run=False,
             report_path=None,
         )
+
+
+def test_export_relocation_preserves_id_and_package_clips_fk(pipeline_run):
+    """Moving an export file must keep exports.id and package_clips.export_id aligned."""
+    import shutil
+
+    from vclip_pipeline.util import export_stable_id, stable_id
+
+    ReconcileService(pipeline_run["repository"]).run(
+        reviewed_xml=pipeline_run["output"],
+        run_id=pipeline_run["result"].stockify_run_id,
+        authority="auto",
+        scope="full-run",
+        report_path=None,
+        allow_conflicts=False,
+    )
+    candidates = pipeline_run["repository"].candidates_for_run(
+        pipeline_run["result"].stockify_run_id,
+        accepted_only=True,
+        approved_only=True,
+    )
+    target = candidates[0]
+    run_id = pipeline_run["result"].stockify_run_id
+    clip_id = target["stock_clip_id"]
+    basename = f"{target['expected_export_basename']}.mp4"
+
+    path_a = pipeline_run["tmp_path"] / "exports-a"
+    path_b = pipeline_run["tmp_path"] / "exports-b"
+    path_a.mkdir()
+    path_b.mkdir()
+    file_a = path_a / basename
+    file_a.write_bytes(b"fake-video-a")
+
+    # Simulate a legacy path-derived export id already in the DB (pre-fix rows).
+    legacy_id = stable_id("EXPORT", run_id, clip_id, str(file_a.resolve()))
+    logical_id = export_stable_id(run_id, clip_id)
+    assert legacy_id != logical_id
+    pipeline_run["repository"].upsert_export(
+        {
+            "id": legacy_id,
+            "stockify_run_id": run_id,
+            "stock_clip_id": clip_id,
+            "exported_filename": basename,
+            "exported_path": str(file_a.resolve()),
+            "match_method": "exact_project_name",
+            "match_confidence": "high",
+            "file_size_bytes": file_a.stat().st_size,
+            "duration_seconds": None,
+            "sha256": None,
+            "reconciled_at": "2026-01-01T00:00:00+00:00",
+        }
+    )
+
+    file_b = path_b / basename
+    shutil.copy2(file_a, file_b)
+
+    output = pipeline_run["tmp_path"] / "packages-relocated"
+    report = PackageService(pipeline_run["repository"]).run(
+        exports_directory=path_b,
+        output_directory=output,
+        run_id=run_id,
+        project_labels={target["generated_project_label"]},
+        mode="copy",
+        weather_provider=NoWeatherProvider(),
+        calculate_checksums=False,
+        inspect_media=False,
+        allow_unmatched=True,
+        allow_missing=True,
+        allow_duration_mismatch=False,
+        allow_unreconciled=False,
+        require_weather=False,
+        overwrite=False,
+        dry_run=False,
+        report_path=None,
+    )
+    assert report.packages_created == 1
+
+    stored = pipeline_run["repository"].export_for_candidate(run_id, clip_id)
+    assert stored is not None
+    assert stored["id"] == legacy_id
+    assert stored["exported_path"] == str(file_b.resolve())
+
+    with pipeline_run["database"].connect() as connection:
+        package_clip = connection.execute(
+            """
+            SELECT export_id, stock_clip_id
+            FROM package_clips
+            WHERE stockify_run_id=? AND stock_clip_id=?
+            """,
+            (run_id, clip_id),
+        ).fetchone()
+        export_exists = connection.execute(
+            "SELECT 1 FROM exports WHERE id=?",
+            (package_clip["export_id"],),
+        ).fetchone()
+    assert package_clip is not None
+    assert package_clip["export_id"] == legacy_id
+    assert export_exists is not None

@@ -32,6 +32,15 @@ def stable_id(prefix: str, *parts: object, length: int = 20) -> str:
     return f"{prefix}_{digest}"
 
 
+def export_stable_id(stockify_run_id: str, stock_clip_id: str) -> str:
+    """Canonical export row id for a logical (run, clip) export.
+
+    Path is mutable metadata on the exports row and must not participate in
+    identity. Existing path-derived ids are preserved by upsert_export().
+    """
+    return stable_id("EXPORT", stockify_run_id, stock_clip_id)
+
+
 def safe_filename(value: str, fallback: str = "untitled") -> str:
     """Turn a display label into a macOS-friendly filename."""
     cleaned = re.sub(r"[\x00-\x1f/:]+", " - ", value or "")

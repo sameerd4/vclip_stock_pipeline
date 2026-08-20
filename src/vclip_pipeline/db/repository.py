@@ -999,7 +999,13 @@ class CatalogRepository:
 
     # Export and package persistence
 
-    def upsert_export(self, values: dict[str, Any]) -> None:
+    def upsert_export(self, values: dict[str, Any]) -> dict[str, Any]:
+        """Insert or update an export row; return the persisted canonical row.
+
+        Conflict key is logical ``(stockify_run_id, stock_clip_id)``. On conflict,
+        ``id`` is preserved and ``exported_path`` (and other metadata) update.
+        Callers must use the returned ``id`` for package_clips / media FKs.
+        """
         with self.database.transaction() as connection:
             _upsert(
                 connection,
@@ -1017,6 +1023,16 @@ class CatalogRepository:
                 "WHERE run_id=? AND stock_clip_id=?",
                 (utc_now(), values["stockify_run_id"], values["stock_clip_id"]),
             )
+            row = connection.execute(
+                "SELECT * FROM exports WHERE stockify_run_id=? AND stock_clip_id=?",
+                (values["stockify_run_id"], values["stock_clip_id"]),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError(
+                "upsert_export failed to persist "
+                f"{values.get('stockify_run_id')}/{values.get('stock_clip_id')}"
+            )
+        return dict(row)
 
     def mark_missing_exports(self, run_id: str, stock_clip_ids: Iterable[str]) -> None:
         ids = list(stock_clip_ids)

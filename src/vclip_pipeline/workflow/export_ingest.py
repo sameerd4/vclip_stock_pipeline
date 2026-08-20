@@ -11,7 +11,7 @@ from ..db.repository import CatalogRepository
 from ..errors import VClipError
 from ..packaging.matcher import ExportMatcher
 from ..packaging.media import MediaProbe, find_video_files, probe_media
-from ..util import sha256_file, stable_id, utc_now
+from ..util import export_stable_id, sha256_file, utc_now
 from .catalog import WorkflowCatalog
 
 
@@ -152,12 +152,7 @@ class ExportIngestService:
                         f"{match.path.name}: exported duration {probe.duration_seconds:.3f}s "
                         f"differs from reviewed duration {float(expected_duration):.3f}s."
                     )
-            export_id = stable_id(
-                "EXPORT",
-                resolved_run_id,
-                match.stock_clip_id,
-                str(match.path.resolve()),
-            )
+            export_id = export_stable_id(resolved_run_id, match.stock_clip_id)
             detail = {
                 "id": export_id,
                 "stockify_run_id": resolved_run_id,
@@ -183,9 +178,11 @@ class ExportIngestService:
 
         if not dry_run:
             for detail, probe in details:
-                self.repository.upsert_export(detail)
+                stored = self.repository.upsert_export(detail)
+                detail["id"] = stored["id"]
+                detail["exported_path"] = stored["exported_path"]
                 self.workflow_catalog.upsert_export_media(
-                    export_id=str(detail["id"]),
+                    export_id=str(stored["id"]),
                     width=probe.width,
                     height=probe.height,
                     codec_name=probe.codec_name,
