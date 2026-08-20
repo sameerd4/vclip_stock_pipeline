@@ -11,7 +11,7 @@ from pathlib import Path
 
 from ..db import CatalogRepository, Database
 from ..errors import VClipError
-from ..publishing import ContentReadinessService, PackageReleaseService
+from ..publishing import ContentReadinessService, PackageReleaseService, ReviewService
 from .catalog import WorkflowCatalog
 from .catalog_quality import (
     CatalogQualityService,
@@ -578,7 +578,88 @@ def build_parser() -> argparse.ArgumentParser:
         help="Root directory that contains <slug>/v<version>/package-release.json.",
     )
     content_validate.set_defaults(handler=_run_publish_content_validate)
+
+    review = publish_sub.add_parser(
+        "review",
+        help="Prepare, inspect, confirm, and validate human rights review.",
+    )
+    review_sub = review.add_subparsers(dest="review_command", required=True)
+
+    review_prepare = review_sub.add_parser(
+        "prepare",
+        help="Compile machine evidence and create/reconcile schema-v2 human review.",
+    )
+    _add_publish_review_common(review_prepare)
+    review_prepare.set_defaults(handler=_run_publish_review_prepare)
+
+    review_list = review_sub.add_parser(
+        "list",
+        help="List review state and machine-risk triage for release clips.",
+    )
+    _add_publish_review_common(review_list)
+    review_list.add_argument("--pending-only", action="store_true")
+    review_list.add_argument("--risk", choices=("LOW", "REVIEW", "HIGH", "UNKNOWN"))
+    review_list.set_defaults(handler=_run_publish_review_list)
+
+    review_show = review_sub.add_parser(
+        "show",
+        help="Show internal evidence and review state for one clip.",
+    )
+    _add_publish_review_common(review_show)
+    review_show.add_argument("--clip", type=_positive_int, required=True)
+    review_show.set_defaults(handler=_run_publish_review_show)
+
+    review_confirm = review_sub.add_parser(
+        "confirm",
+        help="Record human-confirmed facts and derive policy-v1 classification.",
+    )
+    _add_publish_review_common(review_confirm)
+    review_confirm.add_argument("--clip", type=_positive_int, required=True)
+    review_confirm.add_argument("--reviewed-by", required=True)
+    review_confirm.add_argument("--accept-machine-evidence", action="store_true")
+    review_confirm.add_argument(
+        "--recognizable-people",
+        choices=("none", "present_released", "present_unreleased"),
+    )
+    review_confirm.add_argument("--trademarks", choices=("none", "incidental", "prominent"))
+    review_confirm.add_argument(
+        "--copyrighted-artwork", choices=("none", "incidental", "prominent")
+    )
+    review_confirm.add_argument(
+        "--identifiable-property", choices=("none", "incidental", "prominent")
+    )
+    review_confirm.add_argument("--identifying-information", choices=("none", "present"))
+    review_confirm.add_argument("--professional-event-content", choices=("none", "present"))
+    review_confirm.add_argument(
+        "--capture-provenance",
+        choices=(
+            "confirmed_by_operator",
+            "needs_research",
+            "known_problem",
+        ),
+    )
+    review_confirm.add_argument(
+        "--human-status",
+        choices=("confirmed", "needs_research", "blocked"),
+        default="confirmed",
+    )
+    review_confirm.add_argument("--notes")
+    review_confirm.set_defaults(handler=_run_publish_review_confirm)
+
+    review_validate = review_sub.add_parser(
+        "validate",
+        help="Validate standard-package review eligibility and write review-validation.json.",
+    )
+    _add_publish_review_common(review_validate)
+    review_validate.set_defaults(handler=_run_publish_review_validate)
     return parser
+
+
+def _add_publish_review_common(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("slug")
+    parser.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    parser.add_argument("--version", type=_positive_int)
+    parser.add_argument("--release-root", type=Path, required=True)
 
 
 def _run_review_shard(args: argparse.Namespace) -> int:
@@ -1077,6 +1158,145 @@ def _run_publish_release(args: argparse.Namespace) -> int:
         print("Output:      (dry run — no files were written)")
     else:
         print(f"Output:      {manifest['manifest_path']}")
+    return 0
+
+
+def _run_publish_review_prepare(args: argparse.Namespace) -> int:
+    _, workflow = _catalog(args.db)
+    result = ReviewService(workflow).prepare(
+        slug=args.slug,
+        version=args.version,
+        release_root=args.release_root,
+    )
+    print("Rights review prepared")
+    print("----------------------")
+    print(f"Collection:  {result['collection_slug']}")
+    print(f"Version:     {result['collection_version']}")
+    print(f"Clips:       {result['clip_count']}")
+    print(f"Evidence:    {result['rights_evidence_path']}")
+    print(f"Review:      {result['rights_review_path']}")
+    print("Status:      review_prepared (human confirmation still required)")
+    return 0
+
+
+def _run_publish_review_list(args: argparse.Namespace) -> int:
+    _, workflow = _catalog(args.db)
+    result = ReviewService(workflow).list_clips(
+        slug=args.slug,
+        version=args.version,
+        release_root=args.release_root,
+        pending_only=args.pending_only,
+        risk=args.risk,
+    )
+    for row in result["rows"]:
+        caption = str(row["caption"]).strip()
+        if len(caption) > 70:
+            caption = caption[:67].rstrip() + "..."
+        print(
+            f"{row['sort_order']:02d}  {row['risk']:<7}  "
+            f"{row['human_review_status']:<14}  "
+            f"{row['classification']:<20}  {caption}"
+        )
+    totals = result["totals"]
+    print(
+        f"Total: {result['total']}  LOW={totals['LOW']} REVIEW={totals['REVIEW']} "
+        f"HIGH={totals['HIGH']} UNKNOWN={totals['UNKNOWN']}"
+    )
+    return 0
+
+
+def _run_publish_review_show(args: argparse.Namespace) -> int:
+    _, workflow = _catalog(args.db)
+    result = ReviewService(workflow).show(
+        slug=args.slug,
+        version=args.version,
+        release_root=args.release_root,
+        clip=args.clip,
+    )
+    print(f"Clip {result['sort_order']:02d}: {result['customer_filename']}")
+    print(f"Master path: {result['master_path']}")
+    print(f"Duration:    {result['duration_seconds']}")
+    print(f"Caption:     {result['caption']}")
+    print(f"Tags:        {', '.join(result['tags'])}")
+    print(f"Markets:     {', '.join(result['markets'])}")
+    print()
+    print(f"MACHINE EVIDENCE (triage only — {result['machine_risk']} risk)")
+    print("----------------------------------------------------")
+    for name, observation in result["machine_evidence"].items():
+        details = [f"status={observation.get('status')}"]
+        if "prominence" in observation:
+            details.append(f"prominence={observation.get('prominence')}")
+        if observation.get("candidates"):
+            details.append(f"candidates={observation['candidates']}")
+        if observation.get("notes"):
+            details.append(f"notes={observation['notes']}")
+        print(f"{name}: " + "  ".join(details))
+    print()
+    print("HUMAN CONFIRMED FACTS")
+    print("---------------------")
+    for name, value in result["human_confirmed_facts"].items():
+        print(f"{name}: {value}")
+    print()
+    print("HUMAN REVIEW")
+    print("------------")
+    print(json.dumps(result["human_review"], ensure_ascii=False, indent=2))
+    print()
+    print("CAPTURE PROVENANCE")
+    print("------------------")
+    print(json.dumps(result["capture_provenance"], ensure_ascii=False, indent=2))
+    print()
+    print("CLASSIFICATION (policy-derived, not legal advice)")
+    print("-------------------------------------------------")
+    print(json.dumps(result["classification"], ensure_ascii=False, indent=2))
+    return 0
+
+
+def _run_publish_review_confirm(args: argparse.Namespace) -> int:
+    _, workflow = _catalog(args.db)
+    result = ReviewService(workflow).confirm(
+        slug=args.slug,
+        version=args.version,
+        release_root=args.release_root,
+        clip=args.clip,
+        reviewed_by=args.reviewed_by,
+        accept_machine_evidence=args.accept_machine_evidence,
+        recognizable_people=args.recognizable_people,
+        trademarks=args.trademarks,
+        copyrighted_artwork=args.copyrighted_artwork,
+        identifiable_property=args.identifiable_property,
+        identifying_information=args.identifying_information,
+        professional_event_content=args.professional_event_content,
+        capture_provenance=args.capture_provenance,
+        notes=args.notes,
+        human_status=args.human_status,
+    )
+    print(f"Updated clip {result['sort_order']:02d}: {result['customer_filename']}")
+    print(f"Human review:   {result['human_review']['status']}")
+    print(f"Classification: {result['classification']['value']}")
+    for reason in result["classification"]["reasons"]:
+        print(f"  - {reason}")
+    return 0
+
+
+def _run_publish_review_validate(args: argparse.Namespace) -> int:
+    _, workflow = _catalog(args.db)
+    result = ReviewService(workflow).validate(
+        slug=args.slug,
+        version=args.version,
+        release_root=args.release_root,
+    )
+    print("Rights review validation")
+    print("------------------------")
+    print(f"Collection: {result['collection_slug']}")
+    print(f"Version:    {result['collection_version']}")
+    print(f"Clips:      {result['clip_count']}")
+    print(f"Status:     {result['status']}")
+    print(f"Report:     {result['path']}")
+    if result["failures"]:
+        print("Failures:")
+        for failure in result["failures"]:
+            print(f"  - {failure}")
+        return 2
     return 0
 
 

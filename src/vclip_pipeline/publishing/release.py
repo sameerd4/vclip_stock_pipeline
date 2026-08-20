@@ -42,8 +42,7 @@ class PackageReleaseService:
         clips = snapshot["clips"]
         if not clips:
             raise VClipError(
-                f"Collection {definition['slug']} version {version_row['version']} "
-                "has no clips."
+                f"Collection {definition['slug']} version {version_row['version']} has no clips."
             )
 
         title = str(definition["title"])
@@ -128,19 +127,13 @@ class PackageReleaseService:
         if not stock_clip_id:
             raise VClipError("Collection clip is missing stock_clip_id.")
         if not export_id:
-            raise VClipError(
-                f"Collection clip {stock_clip_id} is missing export_id."
-            )
+            raise VClipError(f"Collection clip {stock_clip_id} is missing export_id.")
         if not stockify_run_id:
-            raise VClipError(
-                f"Collection clip {stock_clip_id} is missing stockify_run_id."
-            )
+            raise VClipError(f"Collection clip {stock_clip_id} is missing stockify_run_id.")
 
         exported_path_raw = row.get("exported_path")
         if not exported_path_raw:
-            raise VClipError(
-                f"Collection clip {stock_clip_id} has no exported_path."
-            )
+            raise VClipError(f"Collection clip {stock_clip_id} has no exported_path.")
         master_path = Path(str(exported_path_raw))
         try:
             mode = master_path.lstat().st_mode
@@ -150,20 +143,15 @@ class PackageReleaseService:
             ) from exc
         if not stat.S_ISREG(mode):
             raise VClipError(
-                f"Master export for {stock_clip_id} is not a regular file: "
-                f"{master_path}"
+                f"Master export for {stock_clip_id} is not a regular file: {master_path}"
             )
 
         stored_sha = row.get("sha256")
         if not stored_sha:
-            raise VClipError(
-                f"Export {export_id} for {stock_clip_id} is missing sha256."
-            )
+            raise VClipError(f"Export {export_id} for {stock_clip_id} is missing sha256.")
         duration = row.get("duration_seconds")
         if duration is None:
-            raise VClipError(
-                f"Export {export_id} for {stock_clip_id} is missing duration_seconds."
-            )
+            raise VClipError(f"Export {export_id} for {stock_clip_id} is missing duration_seconds.")
         try:
             duration_value = float(duration)
         except (TypeError, ValueError) as exc:
@@ -179,8 +167,7 @@ class PackageReleaseService:
         media = self._export_media(export_id)
         if media is None:
             raise VClipError(
-                f"Export {export_id} for {stock_clip_id} is missing "
-                "export_media_metadata."
+                f"Export {export_id} for {stock_clip_id} is missing export_media_metadata."
             )
         width = media.get("width")
         height = media.get("height")
@@ -211,14 +198,12 @@ class PackageReleaseService:
 
         sort_order = int(row["sort_order"])
         customer_filename = (
-            safe_filename(f"{title} — Clip {sort_order:02d}")
-            + master_path.suffix.lower()
+            safe_filename(f"{title} — Clip {sort_order:02d}") + master_path.suffix.lower()
         )
         orientation = WorkflowCatalog._orientation(int(width), int(height))
         if orientation is None:
             raise VClipError(
-                f"Export {export_id} for {stock_clip_id} has invalid dimensions "
-                f"{width}x{height}."
+                f"Export {export_id} for {stock_clip_id} has invalid dimensions {width}x{height}."
             )
 
         return {

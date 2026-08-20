@@ -11,7 +11,9 @@ from .release import RELEASE_STATUS
 
 PACKAGE_RELEASE_FILENAME = "package-release.json"
 PUBLIC_METADATA_FILENAME = "public-metadata.json"
+RIGHTS_EVIDENCE_FILENAME = "rights-evidence.json"
 RIGHTS_REVIEW_FILENAME = "rights-review.json"
+REVIEW_VALIDATION_FILENAME = "review-validation.json"
 CONTENT_VALIDATION_FILENAME = "content-validation.json"
 
 
@@ -27,8 +29,16 @@ def public_metadata_path(release_dir: Path) -> Path:
     return release_dir / PUBLIC_METADATA_FILENAME
 
 
+def rights_evidence_path(release_dir: Path) -> Path:
+    return release_dir / "internal" / RIGHTS_EVIDENCE_FILENAME
+
+
 def rights_review_path(release_dir: Path) -> Path:
     return release_dir / "internal" / RIGHTS_REVIEW_FILENAME
+
+
+def review_validation_path(release_dir: Path) -> Path:
+    return release_dir / "internal" / REVIEW_VALIDATION_FILENAME
 
 
 def content_validation_path(release_dir: Path) -> Path:
@@ -61,8 +71,7 @@ def load_package_release(release_dir: Path) -> dict[str, Any]:
     status = manifest.get("status")
     if status != RELEASE_STATUS:
         raise VClipError(
-            f"Package release at {path} has status {status!r}; "
-            f"expected {RELEASE_STATUS!r}."
+            f"Package release at {path} has status {status!r}; expected {RELEASE_STATUS!r}."
         )
     if not isinstance(manifest.get("clips"), list) or not manifest["clips"]:
         raise VClipError(f"Package release at {path} has no clips.")

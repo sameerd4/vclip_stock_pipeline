@@ -13,6 +13,7 @@ from .paths import (
     release_directory,
     write_json,
 )
+from .rights_policy import POLICY_VERSION
 
 
 class PublicMetadataService:
@@ -44,9 +45,7 @@ class PublicMetadataService:
         public = self.build_from_package(package)
         failures = validate_public_metadata(public, package)
         if failures:
-            raise VClipError(
-                "Public metadata is incomplete:\n- " + "\n- ".join(failures)
-            )
+            raise VClipError("Public metadata is incomplete:\n- " + "\n- ".join(failures))
 
         path = public_metadata_path(release_dir)
         write_json(path, public)
@@ -149,9 +148,7 @@ def validate_public_metadata(
 ) -> list[str]:
     """Return human-readable failure reasons; empty means ready."""
     failures: list[str] = []
-    package_clips = {
-        int(clip["sort_order"]): clip for clip in package.get("clips", [])
-    }
+    package_clips = {int(clip["sort_order"]): clip for clip in package.get("clips", [])}
     public_clips = public.get("clips")
     if not isinstance(public_clips, list) or not public_clips:
         return ["public metadata has no clips"]
@@ -189,6 +186,21 @@ def validate_public_metadata(
         if not isinstance(markets, list) or not markets:
             failures.append(f"{label}: missing markets")
 
+        rights = clip.get("rights")
+        if rights is not None:
+            if not isinstance(rights, dict):
+                failures.append(f"{label}: rights must be an object")
+            elif rights.get("classification") not in {
+                "standard",
+                "standard_with_notice",
+            }:
+                failures.append(
+                    f"{label}: invalid public rights classification "
+                    f"{rights.get('classification')!r}"
+                )
+            elif not isinstance(rights.get("notices"), list):
+                failures.append(f"{label}: rights.notices must be a list")
+
         for field in (
             "duration_seconds",
             "width",
@@ -208,17 +220,48 @@ def validate_public_metadata(
 
         forbidden = _forbidden_public_keys(clip)
         if forbidden:
-            failures.append(
-                f"{label}: exposes non-public fields ({', '.join(sorted(forbidden))})"
-            )
+            failures.append(f"{label}: exposes non-public fields ({', '.join(sorted(forbidden))})")
 
     top_forbidden = _forbidden_public_keys(public, top_level=True)
     if top_forbidden:
         failures.append(
-            "public metadata exposes non-public fields "
-            f"({', '.join(sorted(top_forbidden))})"
+            f"public metadata exposes non-public fields ({', '.join(sorted(top_forbidden))})"
         )
     return failures
+
+
+def apply_public_rights(
+    public: dict[str, Any],
+    review: dict[str, Any],
+    package: dict[str, Any],
+) -> None:
+    """Expose only confirmed, standard-package classification and notices."""
+    review_by_order = {int(item["sort_order"]): item for item in review.get("clips", [])}
+    package_by_order = {int(item["sort_order"]): item for item in package.get("clips", [])}
+    for public_clip in public.get("clips", []):
+        public_clip.pop("rights", None)
+        order = int(public_clip["sort_order"])
+        review_clip = review_by_order.get(order)
+        package_clip = package_by_order.get(order)
+        if review_clip is None or package_clip is None:
+            continue
+        if review_clip.get("stock_clip_id") != package_clip.get("stock_clip_id") or review_clip.get(
+            "export_id"
+        ) != package_clip.get("export_id"):
+            continue
+        human_status = (review_clip.get("human_review") or {}).get("status")
+        classification = review_clip.get("classification") or {}
+        value = classification.get("value")
+        if (
+            human_status != "confirmed"
+            or classification.get("policy_version") != POLICY_VERSION
+            or value not in {"standard", "standard_with_notice"}
+        ):
+            continue
+        public_clip["rights"] = {
+            "classification": value,
+            "notices": list(classification.get("customer_notices") or []),
+        }
 
 
 _FORBIDDEN_CLIP_KEYS = {
@@ -253,12 +296,9 @@ def _forbidden_public_keys(
         return found
     # Nested location/GPS blobs are also forbidden if present.
     for key, value in payload.items():
-        if key in {"location", "capture", "gps", "coordinates"} and isinstance(
-            value, dict
-        ):
+        if key in {"location", "capture", "gps", "coordinates"} and isinstance(value, dict):
             if any(
-                coord in value
-                for coord in ("latitude", "longitude", "lat", "lon", "exact_gps")
+                coord in value for coord in ("latitude", "longitude", "lat", "lon", "exact_gps")
             ):
                 found.append(key)
     return found
