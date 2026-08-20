@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -47,8 +48,13 @@ class RightsReviewService:
         package = load_package_release(release_dir)
         path = rights_review_path(release_dir)
         if path.exists():
+            existing_text = path.read_text(encoding="utf-8")
             existing = load_json(path)
             document = reconcile_rights_review(existing, package)
+            rendered = json.dumps(document, indent=2, ensure_ascii=False) + "\n"
+            if rendered == existing_text:
+                document["path"] = str(path)
+                return document
         else:
             document = build_rights_review_template(package)
         write_json(path, document)

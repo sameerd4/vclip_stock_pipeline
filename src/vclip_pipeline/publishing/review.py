@@ -36,10 +36,15 @@ PASSING_CLASSIFICATIONS = {"standard", "standard_with_notice"}
 class ReviewService:
     """Manage the non-web human rights-review workflow."""
 
-    def __init__(self, catalog: WorkflowCatalog) -> None:
+    def __init__(
+        self,
+        catalog: WorkflowCatalog,
+        *,
+        evidence_service: RightsEvidenceService | None = None,
+    ) -> None:
         self.catalog = catalog
         self.public_metadata_service = PublicMetadataService(catalog)
-        self.evidence_service = RightsEvidenceService(catalog)
+        self.evidence_service = evidence_service or RightsEvidenceService(catalog)
         self.review_service = RightsReviewService()
 
     def prepare(
@@ -48,23 +53,44 @@ class ReviewService:
         slug: str,
         version: int | None,
         release_root: Path,
+        provider: str = "existing",
+        model: str = "gpt-5-mini",
+        cache: Path | None = None,
+        refresh: bool = False,
+        clip: int | None = None,
     ) -> dict[str, Any]:
         resolved = resolve_collection_version(self.catalog, slug=slug, version=version)
         public = self.public_metadata_service.prepare(
             slug=slug, version=resolved, release_root=release_root
         )
         evidence = self.evidence_service.prepare(
-            slug=slug, version=resolved, release_root=release_root
+            slug=slug,
+            version=resolved,
+            release_root=release_root,
+            provider=provider,
+            model=model,
+            cache_root=cache,
+            refresh=refresh,
+            clip=clip,
         )
         review = self.review_service.prepare(slug=slug, version=resolved, release_root=release_root)
+        source = evidence.get("source") or {}
         return {
             "status": "review_prepared",
             "collection_slug": slug,
             "collection_version": resolved,
+            "clip": clip,
             "clip_count": review["clip_count"],
             "public_metadata_path": public["path"],
             "rights_evidence_path": evidence["path"],
             "rights_review_path": review["path"],
+            "provider": source.get("provider", provider),
+            "model": source.get("model"),
+            "openai_requests": source.get("openai_requests", 0),
+            "cached_clips": source.get("cached_clips", 0),
+            "sampled_frame_count_total": source.get("sampled_frame_count_total", 0),
+            "network_calls": source.get("network_calls", False),
+            "usage": source.get("usage"),
         }
 
     def list_clips(

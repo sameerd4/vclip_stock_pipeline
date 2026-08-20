@@ -590,6 +590,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Compile machine evidence and create/reconcile schema-v2 human review.",
     )
     _add_publish_review_common(review_prepare)
+    review_prepare.add_argument(
+        "--provider",
+        choices=("existing", "openai"),
+        default="existing",
+        help="existing uses cached/stored evidence only; openai samples local JPEGs.",
+    )
+    review_prepare.add_argument("--model", default="gpt-5-mini")
+    review_prepare.add_argument(
+        "--cache",
+        type=Path,
+        help="Required for --provider openai. Rights-evidence and JPEG frame cache root.",
+    )
+    review_prepare.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Re-extract stills and regenerate OpenAI rights evidence (openai only).",
+    )
+    review_prepare.add_argument(
+        "--clip",
+        type=_positive_int,
+        help="Generate/refresh machine rights evidence for one collection sort_order only.",
+    )
     review_prepare.set_defaults(handler=_run_publish_review_prepare)
 
     review_list = review_sub.add_parser(
@@ -1167,14 +1189,32 @@ def _run_publish_review_prepare(args: argparse.Namespace) -> int:
         slug=args.slug,
         version=args.version,
         release_root=args.release_root,
+        provider=args.provider,
+        model=args.model,
+        cache=args.cache,
+        refresh=args.refresh,
+        clip=args.clip,
     )
     print("Rights review prepared")
     print("----------------------")
     print(f"Collection:  {result['collection_slug']}")
     print(f"Version:     {result['collection_version']}")
     print(f"Clips:       {result['clip_count']}")
+    if args.clip is not None:
+        print(f"Clip:        {args.clip}")
+    print(f"Provider:    {result['provider']}")
     print(f"Evidence:    {result['rights_evidence_path']}")
     print(f"Review:      {result['rights_review_path']}")
+    if result["provider"] == "openai":
+        print(f"OpenAI reqs: {result['openai_requests']}")
+        print(f"Cached:      {result['cached_clips']}")
+        print(f"JPEG frames: {result['sampled_frame_count_total']}")
+        usage = result.get("usage") or {}
+        if usage:
+            cost = usage.get("estimated_total_cost_usd")
+            cost_text = "n/a" if cost is None else f"${cost:.4f}"
+            print(f"Tokens:      {usage.get('total_tokens') or 0}")
+            print(f"Est. cost:   {cost_text}")
     print("Status:      review_prepared (human confirmation still required)")
     return 0
 

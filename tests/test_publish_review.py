@@ -262,6 +262,41 @@ def test_old_pending_schema_migrates_but_human_decisions_refuse(pipeline_run) ->
             "HIGH",
         ),
         (
+            lambda value: value["trademarks"].update(
+                {"status": "detected", "prominence": "prominent", "candidates": ["Example"]}
+            ),
+            "HIGH",
+        ),
+        (
+            lambda value: value["identifiable_property"].update(
+                {
+                    "status": "detected",
+                    "prominence": "prominent",
+                    "candidates": ["Oracle Park"],
+                }
+            ),
+            "REVIEW",
+        ),
+        (
+            lambda value: (
+                value["identifiable_property"].update(
+                    {
+                        "status": "detected",
+                        "prominence": "prominent",
+                        "candidates": ["baseball stadium"],
+                    }
+                ),
+                value["trademarks"].update(
+                    {
+                        "status": "possible",
+                        "prominence": "incidental",
+                        "candidates": ["stadium signage"],
+                    }
+                ),
+            ),
+            "REVIEW",
+        ),
+        (
             lambda value: value["recognizable_people"].update({"status": "unknown"}),
             "UNKNOWN",
         ),
@@ -658,6 +693,12 @@ def test_review_cli_prepare_show_confirm_validate(monkeypatch, capsys, tmp_path)
                 "clip_count": 1,
                 "rights_evidence_path": str(tmp_path / "rights-evidence.json"),
                 "rights_review_path": str(tmp_path / "rights-review.json"),
+                "provider": kwargs.get("provider", "existing"),
+                "openai_requests": 0,
+                "cached_clips": 0,
+                "sampled_frame_count_total": 0,
+                "network_calls": False,
+                "usage": None,
             }
 
         def show(self, **kwargs):
