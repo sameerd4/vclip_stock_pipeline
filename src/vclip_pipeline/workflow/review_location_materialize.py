@@ -18,6 +18,7 @@ from ..stockify.location_recovery import _relabel_project
 from ..stockify.naming import TIME_LABELS, event_base_name, project_base_label
 from ..util import json_dumps, safe_filename, utc_now
 from .catalog import WorkflowCatalog
+from .editorial_group_forensics import country_for_admin_area
 from .physical_location_coverage import (
     build_physical_audit,
     collect_physical_candidates,
@@ -748,7 +749,7 @@ class ReviewLocationMaterializeService:
             "center_lon": None,
             "sample_count": 0,
             "valid_sample_count": 0,
-            "country": "United States",
+            "country": None,
             "state": "Washington" if "Washington" in label else None,
             "region": "Washington" if "Washington" in label else None,
             "city": label.split(",")[0].strip() if "," in label else label,
@@ -773,6 +774,10 @@ class ReviewLocationMaterializeService:
             location["city"] = left
             location["state"] = right
             location["region"] = right
+        location["country"] = country_for_admin_area(
+            location.get("state"),
+            explicit_country=str(consensus.get("country") or "") or None,
+        )
         new_event = event_base_name(location, {"date": capture_date or "Unknown Date"})
         old_project = str(appearance.get("project_name") or "")
         time_of_day = _time_of_day_for_project(old_project, row)

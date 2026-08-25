@@ -5,8 +5,9 @@ import struct
 from datetime import datetime
 from pathlib import Path
 
+from test_review_color_integrity import _seed_candidate
+
 from vclip_pipeline.db import CatalogRepository, Database
-from vclip_pipeline.geo import LocationResolver
 from vclip_pipeline.stockify.jpg_exif_same_shoot import (
     EVIDENCE_SOURCE,
     DjiFileIdentity,
@@ -20,9 +21,6 @@ from vclip_pipeline.stockify.jpg_exif_same_shoot import (
 from vclip_pipeline.util import json_dumps
 from vclip_pipeline.workflow.catalog import WorkflowCatalog
 from vclip_pipeline.workflow.review_location_recover import ReviewLocationRecoverService
-
-from test_review_color_integrity import _seed_candidate
-
 
 NS = "http://www.apple.com/finalcutpro/fcpxml"
 
@@ -246,9 +244,7 @@ def test_medium_and_low_require_review():
             lon=-122.32085,
         ),
     ]
-    medium = infer_jpg_exif_same_shoot(
-        video, jpg_index={"2025-11-08": medium_photos}
-    )
+    medium = infer_jpg_exif_same_shoot(video, jpg_index={"2025-11-08": medium_photos})
     assert medium is not None
     assert medium.confidence == "medium"
     assert medium.review_required is True
@@ -266,6 +262,36 @@ def test_medium_and_low_require_review():
     assert low is not None
     assert low.confidence == "low"
     assert low.review_required is True
+
+
+def test_duplicate_archive_and_fcp_copies_count_once():
+    video = "DJI_20251108214016_0580_D.mp4"
+    dt = datetime(2025, 11, 8, 21, 39, 54)
+    photos = [
+        _photo(
+            path="/archive/DJI_20251108213954_0578_D.JPG",
+            seq=578,
+            dt=dt,
+            lat=47.61189,
+            lon=-122.3209,
+        ),
+        _photo(
+            path="/library.fcpbundle/Original Media/DJI_20251108213954_0578_D.JPG",
+            seq=578,
+            dt=dt,
+            lat=47.61189,
+            lon=-122.3209,
+        ),
+    ]
+    inference = infer_jpg_exif_same_shoot(video, jpg_index={"2025-11-08": photos})
+    assert inference is not None
+    assert inference.confidence == "high"
+    assert inference.sample_count == 1
+    assert len(inference.evidence_photos) == 1
+    assert inference.evidence_photos[0].path == "/archive/DJI_20251108213954_0578_D.JPG"
+    assert inference.evidence_photos[0].duplicate_paths == [
+        "/library.fcpbundle/Original Media/DJI_20251108213954_0578_D.JPG"
+    ]
 
 
 def _write_unknown_shard(
@@ -337,9 +363,7 @@ def test_forensic_mode_is_read_only_and_preserves_provenance(tmp_path: Path):
     media_dir.mkdir(parents=True)
     (media_dir / source).write_bytes(b"fake")
     jpg_path = media_dir / "DJI_20251108213954_0578_D.JPG"
-    jpg_path.write_bytes(
-        _build_jpeg_with_gps(latitude=47.61189, longitude=-122.3209)
-    )
+    jpg_path.write_bytes(_build_jpeg_with_gps(latitude=47.61189, longitude=-122.3209))
     _seed_candidate(
         database,
         run_id=run_id,
@@ -419,19 +443,12 @@ def test_forensic_mode_is_read_only_and_preserves_provenance(tmp_path: Path):
 
 def test_index_jpg_photos_includes_fcpbundle_original_media(tmp_path: Path):
     """Same-day JPG index must see DJI stills inside FCP Original Media."""
-    original = (
-        tmp_path
-        / "May 2026 - Seattle.fcpbundle"
-        / "Finals"
-        / "Original Media"
-    )
+    original = tmp_path / "May 2026 - Seattle.fcpbundle" / "Finals" / "Original Media"
     original.mkdir(parents=True)
     # Heavy FCP internals should be skipped, not required for indexing.
     (tmp_path / "May 2026 - Seattle.fcpbundle" / "Render Files").mkdir(parents=True)
     jpg_name = "DJI_20260502195525_0040_D.jpg"
-    (original / jpg_name).write_bytes(
-        _build_jpeg_with_gps(latitude=47.606, longitude=-122.332)
-    )
+    (original / jpg_name).write_bytes(_build_jpeg_with_gps(latitude=47.606, longitude=-122.332))
     # AppleDouble sidecar must not be indexed.
     (original / f"._#{jpg_name}").write_bytes(b"junk")
     (original / f"._{jpg_name}").write_bytes(b"junk")

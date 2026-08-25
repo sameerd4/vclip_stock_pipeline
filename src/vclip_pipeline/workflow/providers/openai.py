@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ...errors import VClipError
+from ..entities import EntityCatalog
 from ..models import (
     NamedSubject,
     ProviderUsage,
@@ -19,10 +20,8 @@ from ..models import (
     VisualAnalysisResult,
     VisualTag,
 )
-from ..entities import EntityCatalog
 from ..pricing import estimate_token_costs
 from ..taxonomy import VisualTaxonomy
-
 
 PROMPT_VERSION = "visual-taxonomy-v3"
 MAX_TAGS = 12
@@ -90,6 +89,57 @@ VISUAL_ANALYSIS_SCHEMA: dict[str, Any] = {
 }
 
 
+class OpenAIResponsesClient:
+    """Shared Responses API HTTP client. Never accepts local media paths."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        endpoint: str = "https://api.openai.com/v1/responses",
+        timeout_seconds: float = 120.0,
+        retries: int = 3,
+    ) -> None:
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        self.endpoint = endpoint
+        self.timeout_seconds = timeout_seconds
+        self.retries = retries
+        if not self.api_key:
+            raise VClipError("OPENAI_API_KEY is required for --provider openai.")
+
+    def post(self, payload: dict[str, Any]) -> dict[str, Any]:
+        body = json.dumps(payload).encode("utf-8")
+        last_error: Exception | None = None
+        for attempt in range(1, self.retries + 1):
+            request = urllib.request.Request(
+                self.endpoint,
+                data=body,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(
+                    request,
+                    timeout=self.timeout_seconds,
+                ) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                last_error = VClipError(
+                    f"OpenAI visual analysis failed ({exc.code}): {detail[:1000]}"
+                )
+                if exc.code not in {408, 409, 429, 500, 502, 503, 504}:
+                    raise last_error from exc
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+                last_error = exc
+            if attempt < self.retries:
+                time.sleep(2 ** (attempt - 1))
+        raise VClipError(f"OpenAI visual analysis failed after retries: {last_error}")
+
+
 class OpenAIVisualAnalyzer:
     """Analyze six representative JPEGs in one low-detail multimodal request."""
 
@@ -105,16 +155,21 @@ class OpenAIVisualAnalyzer:
         timeout_seconds: float = 120.0,
         retries: int = 3,
         entities: EntityCatalog | None = None,
+        http: OpenAIResponsesClient | None = None,
     ) -> None:
         self.taxonomy = taxonomy
         self.model = model
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
-        self.endpoint = endpoint
-        self.timeout_seconds = timeout_seconds
-        self.retries = retries
         self.entities = entities or EntityCatalog.default()
-        if not self.api_key:
-            raise VClipError("OPENAI_API_KEY is required for --provider openai.")
+        self._http = http or OpenAIResponsesClient(
+            api_key=api_key,
+            endpoint=endpoint,
+            timeout_seconds=timeout_seconds,
+            retries=retries,
+        )
+        self.api_key = self._http.api_key
+        self.endpoint = self._http.endpoint
+        self.timeout_seconds = self._http.timeout_seconds
+        self.retries = self._http.retries
 
     def analyze(
         self,
@@ -123,9 +178,7 @@ class OpenAIVisualAnalyzer:
         context: dict[str, Any],
     ) -> VisualAnalysisResult:
         prompt = self._prompt(context)
-        content: list[dict[str, Any]] = [
-            {"type": "input_text", "text": prompt}
-        ]
+        content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
         for frame in frames:
             encoded = base64.b64encode(frame.read_bytes()).decode("ascii")
             content.append(
@@ -154,6 +207,9 @@ class OpenAIVisualAnalyzer:
         analysis = self._normalize(parsed)
         usage = self.parse_usage(response, model=self.model)
         return VisualAnalysisResult(analysis=analysis, usage=usage)
+
+    def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._http.post(payload)
 
     def _prompt(self, context: dict[str, Any]) -> str:
         return json.dumps(
@@ -210,45 +266,12 @@ class OpenAIVisualAnalyzer:
                     ],
                 },
                 "output_rule": (
-                    "Return only JSON matching the provided schema. "
-                    "No Markdown or commentary."
+                    "Return only JSON matching the provided schema. No Markdown or commentary."
                 ),
                 "prompt_version": PROMPT_VERSION,
             },
             ensure_ascii=False,
         )
-
-    def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
-        body = json.dumps(payload).encode("utf-8")
-        last_error: Exception | None = None
-        for attempt in range(1, self.retries + 1):
-            request = urllib.request.Request(
-                self.endpoint,
-                data=body,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(
-                    request,
-                    timeout=self.timeout_seconds,
-                ) as response:
-                    return json.loads(response.read().decode("utf-8"))
-            except urllib.error.HTTPError as exc:
-                detail = exc.read().decode("utf-8", errors="replace")
-                last_error = VClipError(
-                    f"OpenAI visual analysis failed ({exc.code}): {detail[:1000]}"
-                )
-                if exc.code not in {408, 409, 429, 500, 502, 503, 504}:
-                    raise last_error from exc
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-                last_error = exc
-            if attempt < self.retries:
-                time.sleep(2 ** (attempt - 1))
-        raise VClipError(f"OpenAI visual analysis failed after retries: {last_error}")
 
     @staticmethod
     def _response_text(response: dict[str, Any]) -> str:
@@ -301,14 +324,10 @@ class OpenAIVisualAnalyzer:
         input_details = raw_usage.get("input_tokens_details") or {}
         output_details = raw_usage.get("output_tokens_details") or {}
         cached_input_tokens = _optional_int(
-            input_details.get("cached_tokens")
-            if isinstance(input_details, dict)
-            else None
+            input_details.get("cached_tokens") if isinstance(input_details, dict) else None
         )
         reasoning_tokens = _optional_int(
-            output_details.get("reasoning_tokens")
-            if isinstance(output_details, dict)
-            else None
+            output_details.get("reasoning_tokens") if isinstance(output_details, dict) else None
         )
         # Bill output_tokens as reported. Reasoning is a breakdown, not additive.
         costs = estimate_token_costs(

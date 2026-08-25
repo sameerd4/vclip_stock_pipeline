@@ -11,7 +11,13 @@ from pathlib import Path
 
 from ..db import CatalogRepository, Database
 from ..errors import VClipError
+from ..publishing import ContentReadinessService, PackageReleaseService, ReviewService
 from .catalog import WorkflowCatalog
+from .catalog_inventory import (
+    GROUP_BY_CHOICES,
+    ORIENTATION_CHOICES,
+    format_location_inventory_text,
+)
 from .catalog_quality import (
     CatalogQualityService,
     format_quality_report,
@@ -23,9 +29,6 @@ from .entities import EntityCatalog
 from .export_ingest import ExportIngestService
 from .frames import FrameSampler
 from .providers import OpenAIVisualAnalyzer
-from .review_dedupe import ReviewDedupeService, format_text_report
-from .review_dedupe_batch import ReviewDedupeBatchService, format_batch_text_report
-from .review_dedupe_global import ReviewGlobalDedupeService, format_global_text_report
 from .review_color_integrity import (
     ReviewColorIntegrityService,
     format_color_integrity_text,
@@ -34,13 +37,24 @@ from .review_color_repair import (
     ReviewColorRepairService,
     format_color_repair_text,
 )
+from .review_dedupe import ReviewDedupeService, format_text_report
+from .review_dedupe_batch import ReviewDedupeBatchService, format_batch_text_report
+from .review_dedupe_global import ReviewGlobalDedupeService, format_global_text_report
 from .review_location_materialize import (
     ReviewLocationMaterializeService,
     format_materialize_plan_text,
 )
+from .review_location_propagate import (
+    HistoricalLocationPropagateService,
+    format_propagate_report_text,
+)
 from .review_location_recover import (
     ReviewLocationRecoverService,
     format_location_recover_text,
+)
+from .review_location_restore import (
+    HistoricalLocationRestoreService,
+    format_restore_report_text,
 )
 from .review_prune import ReviewPruneService, format_prune_text_report
 from .review_shard import ReviewShardService
@@ -99,9 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
     shard.add_argument("review_xml", type=Path)
     shard.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
     shard.add_argument("--output", type=Path, required=True)
-    shard.add_argument(
-        "--group-by", choices=("market", "event", "none"), default="market"
-    )
+    shard.add_argument("--group-by", choices=("market", "event", "none"), default="market")
     shard.add_argument(
         "--representation",
         choices=("individual", "compilation", "both"),
@@ -401,6 +413,115 @@ def build_parser() -> argparse.ArgumentParser:
     materialize.add_argument("--quiet", action="store_true")
     materialize.set_defaults(handler=_run_review_location_materialize)
 
+    restore_loc = sub.add_parser(
+        "review-location-restore",
+        help=(
+            "Validate historical review-location materialization against the "
+            "catalog (default, read-only) or persist safe_to_restore rows "
+            "with --write. Does not remount media or rewrite FCPXML."
+        ),
+    )
+    restore_loc.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    restore_loc.add_argument(
+        "--plan",
+        type=Path,
+        required=True,
+        help="Historical location-materialization-plan.json recovery journal.",
+    )
+    restore_loc.add_argument(
+        "--forensic-json",
+        type=Path,
+        required=True,
+        help="Historical jpg-exif-forensic.json used to join source evidence.",
+    )
+    restore_loc.add_argument(
+        "--review-root",
+        type=Path,
+        help="Optional final FCPXML corpus for a read-only name/identity audit.",
+    )
+    restore_loc.add_argument("--report", type=Path, help="Write restore-validation JSON here.")
+    restore_loc.add_argument("--text-report", type=Path)
+    restore_loc.add_argument(
+        "--write",
+        action="store_true",
+        help=(
+            "Persist safe_to_restore catalog rows in one transaction after a "
+            "timestamped SQLite backup. Default is validation/dry-run."
+        ),
+    )
+    restore_loc.add_argument(
+        "--backup-path",
+        type=Path,
+        help="Explicit backup destination for --write. Never overwrites.",
+    )
+    restore_loc.add_argument("--quiet", action="store_true")
+    restore_loc.set_defaults(handler=_run_review_location_restore)
+
+    propagate_loc = sub.add_parser(
+        "review-location-propagate",
+        help=(
+            "Validate historical location copies (default, read-only) or persist "
+            "safe_to_restore rows with --write. Phase 1 copies older-DB/corpus "
+            "locations. Phase 2 copies safe source-identity donor locations. "
+            "Does not remount media, rerun inference, or rewrite FCPXML."
+        ),
+    )
+    propagate_loc.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    propagate_loc.add_argument(
+        "--phase",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="1 = older-DB/corpus (default). 2 = safe source-identity inherit.",
+    )
+    propagate_loc.add_argument(
+        "--reconciliation",
+        type=Path,
+        help=(
+            "current-unresolved-location-reconciliation.json. Required for "
+            "Phase 1."
+        ),
+    )
+    propagate_loc.add_argument(
+        "--report",
+        type=Path,
+        help="Write validation JSON here.",
+    )
+    propagate_loc.add_argument("--text-report", type=Path)
+    propagate_loc.add_argument(
+        "--source-identity-safety",
+        type=Path,
+        help=(
+            "Phase 2 input: source-identity-propagation-safety.json. Only "
+            "safe_to_inherit rows are considered."
+        ),
+    )
+    propagate_loc.add_argument(
+        "--source-identity-report",
+        type=Path,
+        help=(
+            "Write the source-identity safety JSON here. Phase 1 reports all "
+            "165 cases; Phase 2 reports excluded/live-safe counts."
+        ),
+    )
+    propagate_loc.add_argument(
+        "--write",
+        action="store_true",
+        help=(
+            "Persist safe_to_restore catalog rows in one transaction after a "
+            "timestamped SQLite backup. Default is validation/dry-run. "
+            "Never writes FCPXML. Phase 2 never writes ambiguous rows and "
+            "does not flatten session summaries."
+        ),
+    )
+    propagate_loc.add_argument(
+        "--backup-path",
+        type=Path,
+        help="Explicit backup destination for --write. Never overwrites.",
+    )
+    propagate_loc.add_argument("--quiet", action="store_true")
+    propagate_loc.set_defaults(handler=_run_review_location_propagate)
+
     ingest = sub.add_parser(
         "exports-ingest",
         help="Match and persist final exports without creating packages.",
@@ -457,6 +578,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     search.add_argument("--json", action="store_true")
     search.set_defaults(handler=_run_catalog_search)
+    locations = catalog_sub.add_parser(
+        "locations",
+        help="Read-only geographic inventory of exported stock clips.",
+    )
+    locations.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    locations.add_argument(
+        "--group-by",
+        choices=GROUP_BY_CHOICES,
+        default="city",
+        help="Grouping key. Default: city.",
+    )
+    locations.add_argument("--city", help="Filter to a resolved city name.")
+    locations.add_argument(
+        "--neighborhood",
+        help="Filter to a resolved neighborhood name.",
+    )
+    locations.add_argument(
+        "--market",
+        help="Filter to clips assigned to this market id or label.",
+    )
+    locations.add_argument(
+        "--orientation",
+        choices=ORIENTATION_CHOICES,
+        help="Filter to vertical or horizontal (landscape) exports.",
+    )
+    locations.add_argument("--json", action="store_true")
+    locations.set_defaults(handler=_run_catalog_locations)
     audit = catalog_sub.add_parser(
         "audit",
         help="Audit visual-enrichment quality for a run/cohort (no OpenAI calls).",
@@ -521,7 +669,168 @@ def build_parser() -> argparse.ArgumentParser:
     materialize.add_argument("--overwrite", action="store_true")
     materialize.add_argument("--dry-run", action="store_true")
     materialize.set_defaults(handler=_run_collection_materialize)
+
+    publish_ns = sub.add_parser(
+        "publish",
+        help="Compile customer-facing package releases from frozen collections.",
+    )
+    publish_sub = publish_ns.add_subparsers(dest="publish_command", required=True)
+    release = publish_sub.add_parser(
+        "release",
+        help=(
+            "Validate masters and write package-release.json for a collection "
+            "version (no media copy)."
+        ),
+    )
+    release.add_argument("slug")
+    release.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    release.add_argument("--version", type=_positive_int)
+    release.add_argument("--output", type=Path, required=True)
+    release.add_argument("--overwrite", action="store_true")
+    release.add_argument("--dry-run", action="store_true")
+    release.set_defaults(handler=_run_publish_release)
+
+    content = publish_sub.add_parser(
+        "content",
+        help="Prepare and validate customer-safe metadata and human rights review.",
+    )
+    content_sub = content.add_subparsers(dest="content_command", required=True)
+    content_prepare = content_sub.add_parser(
+        "prepare",
+        help=(
+            "Write public-metadata.json and create/reconcile "
+            "internal/rights-review.json for an existing package release."
+        ),
+    )
+    content_prepare.add_argument("slug")
+    content_prepare.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    content_prepare.add_argument("--version", type=_positive_int)
+    content_prepare.add_argument(
+        "--release-root",
+        type=Path,
+        required=True,
+        help="Root directory that contains <slug>/v<version>/package-release.json.",
+    )
+    content_prepare.set_defaults(handler=_run_publish_content_prepare)
+
+    content_validate = content_sub.add_parser(
+        "validate",
+        help="Validate public metadata + rights review and write content-validation.json.",
+    )
+    content_validate.add_argument("slug")
+    content_validate.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    content_validate.add_argument("--version", type=_positive_int)
+    content_validate.add_argument(
+        "--release-root",
+        type=Path,
+        required=True,
+        help="Root directory that contains <slug>/v<version>/package-release.json.",
+    )
+    content_validate.set_defaults(handler=_run_publish_content_validate)
+
+    review = publish_sub.add_parser(
+        "review",
+        help="Prepare, inspect, confirm, and validate human rights review.",
+    )
+    review_sub = review.add_subparsers(dest="review_command", required=True)
+
+    review_prepare = review_sub.add_parser(
+        "prepare",
+        help="Compile machine evidence and create/reconcile schema-v2 human review.",
+    )
+    _add_publish_review_common(review_prepare)
+    review_prepare.add_argument(
+        "--provider",
+        choices=("existing", "openai"),
+        default="existing",
+        help="existing uses cached/stored evidence only; openai samples local JPEGs.",
+    )
+    review_prepare.add_argument("--model", default="gpt-5-mini")
+    review_prepare.add_argument(
+        "--cache",
+        type=Path,
+        help="Required for --provider openai. Rights-evidence and JPEG frame cache root.",
+    )
+    review_prepare.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Re-extract stills and regenerate OpenAI rights evidence (openai only).",
+    )
+    review_prepare.add_argument(
+        "--clip",
+        type=_positive_int,
+        help="Generate/refresh machine rights evidence for one collection sort_order only.",
+    )
+    review_prepare.set_defaults(handler=_run_publish_review_prepare)
+
+    review_list = review_sub.add_parser(
+        "list",
+        help="List review state and machine-risk triage for release clips.",
+    )
+    _add_publish_review_common(review_list)
+    review_list.add_argument("--pending-only", action="store_true")
+    review_list.add_argument("--risk", choices=("LOW", "REVIEW", "HIGH", "UNKNOWN"))
+    review_list.set_defaults(handler=_run_publish_review_list)
+
+    review_show = review_sub.add_parser(
+        "show",
+        help="Show internal evidence and review state for one clip.",
+    )
+    _add_publish_review_common(review_show)
+    review_show.add_argument("--clip", type=_positive_int, required=True)
+    review_show.set_defaults(handler=_run_publish_review_show)
+
+    review_confirm = review_sub.add_parser(
+        "confirm",
+        help="Record human-confirmed facts and derive policy-v1 classification.",
+    )
+    _add_publish_review_common(review_confirm)
+    review_confirm.add_argument("--clip", type=_positive_int, required=True)
+    review_confirm.add_argument("--reviewed-by", required=True)
+    review_confirm.add_argument("--accept-machine-evidence", action="store_true")
+    review_confirm.add_argument(
+        "--recognizable-people",
+        choices=("none", "present_released", "present_unreleased"),
+    )
+    review_confirm.add_argument("--trademarks", choices=("none", "incidental", "prominent"))
+    review_confirm.add_argument(
+        "--copyrighted-artwork", choices=("none", "incidental", "prominent")
+    )
+    review_confirm.add_argument(
+        "--identifiable-property", choices=("none", "incidental", "prominent")
+    )
+    review_confirm.add_argument("--identifying-information", choices=("none", "present"))
+    review_confirm.add_argument("--professional-event-content", choices=("none", "present"))
+    review_confirm.add_argument(
+        "--capture-provenance",
+        choices=(
+            "confirmed_by_operator",
+            "needs_research",
+            "known_problem",
+        ),
+    )
+    review_confirm.add_argument(
+        "--human-status",
+        choices=("confirmed", "needs_research", "blocked"),
+        default="confirmed",
+    )
+    review_confirm.add_argument("--notes")
+    review_confirm.set_defaults(handler=_run_publish_review_confirm)
+
+    review_validate = review_sub.add_parser(
+        "validate",
+        help="Validate standard-package review eligibility and write review-validation.json.",
+    )
+    _add_publish_review_common(review_validate)
+    review_validate.set_defaults(handler=_run_publish_review_validate)
     return parser
+
+
+def _add_publish_review_common(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("slug")
+    parser.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    parser.add_argument("--version", type=_positive_int)
+    parser.add_argument("--release-root", type=Path, required=True)
 
 
 def _run_review_shard(args: argparse.Namespace) -> int:
@@ -564,9 +873,7 @@ def _run_review_dedupe(args: argparse.Namespace) -> int:
         output_xml=args.output.expanduser().resolve(),
         report_path=args.report.expanduser().resolve(),
         text_report_path=args.text_report.expanduser().resolve(),
-        manifest_path=(
-            args.manifest.expanduser().resolve() if args.manifest else None
-        ),
+        manifest_path=(args.manifest.expanduser().resolve() if args.manifest else None),
         dry_run=args.dry_run,
         overwrite=args.overwrite,
     )
@@ -656,9 +963,7 @@ def _run_review_color_integrity(args: argparse.Namespace) -> int:
         report_path=args.report.expanduser().resolve(),
         text_report_path=args.text_report.expanduser().resolve(),
         media_roots=[path.expanduser().resolve() for path in (args.media_root or [])],
-        csv_report_path=(
-            args.csv_report.expanduser().resolve() if args.csv_report else None
-        ),
+        csv_report_path=(args.csv_report.expanduser().resolve() if args.csv_report else None),
     )
     print()
     print(format_color_integrity_text(report).rstrip())
@@ -675,9 +980,7 @@ def _run_review_color_integrity(args: argparse.Namespace) -> int:
             f"{counts.get('DLOG_NO_CAMERA_LUT', 0)} no camera LUT, "
             f"{len(report.camera_lut_signatures)} distinct LUT signatures"
         )
-    parse_failures = sum(
-        1 for item in report.failures if item.get("status") == "xml_parse_error"
-    )
+    parse_failures = sum(1 for item in report.failures if item.get("status") == "xml_parse_error")
     return 1 if parse_failures else 0
 
 
@@ -744,14 +1047,142 @@ def _run_review_location_materialize(args: argparse.Namespace) -> int:
     return 1 if report.shards_failed else 0
 
 
+def _run_review_location_restore(args: argparse.Namespace) -> int:
+    db_path = args.db.expanduser().resolve()
+    write = bool(args.write)
+    if write:
+        repository, workflow = _catalog(args.db)
+    else:
+        database = Database(db_path)
+        repository = CatalogRepository(database)
+        workflow = WorkflowCatalog(database)
+    service = HistoricalLocationRestoreService(
+        repository,
+        workflow,
+        progress=_progress(args.quiet),
+    )
+    plan_path = args.plan.expanduser().resolve()
+    forensic_json = args.forensic_json.expanduser().resolve()
+    review_root = (
+        args.review_root.expanduser().resolve() if args.review_root else None
+    )
+    if write:
+        if args.backup_path:
+            print(f"Requested backup path: {args.backup_path.expanduser().resolve()}")
+        report = service.restore(
+            plan_path=plan_path,
+            forensic_json=forensic_json,
+            review_root=review_root,
+            write=True,
+            backup_path=(
+                args.backup_path.expanduser().resolve() if args.backup_path else None
+            ),
+        )
+        print(f"Backup: {report.backup_path}")
+    else:
+        report = service.validate(
+            plan_path=plan_path,
+            forensic_json=forensic_json,
+            review_root=review_root,
+        )
+    text = format_restore_report_text(report)
+    print()
+    print(text.rstrip())
+    if args.report:
+        report_path = args.report.expanduser().resolve()
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            json.dumps(report.as_dict(), indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        print(f"JSON report: {report_path}")
+    if args.text_report:
+        text_path = args.text_report.expanduser().resolve()
+        text_path.parent.mkdir(parents=True, exist_ok=True)
+        text_path.write_text(text, encoding="utf-8")
+        print(f"Text report: {text_path}")
+    return 0
+
+
+def _run_review_location_propagate(args: argparse.Namespace) -> int:
+    db_path = args.db.expanduser().resolve()
+    write = bool(args.write)
+    if write:
+        repository, workflow = _catalog(args.db)
+    else:
+        database = Database(db_path)
+        repository = CatalogRepository(database)
+        workflow = None
+    service = HistoricalLocationPropagateService(
+        repository,
+        workflow,
+        progress=_progress(args.quiet),
+    )
+    phase = int(args.phase)
+    reconciliation_path = (
+        args.reconciliation.expanduser().resolve() if args.reconciliation else None
+    )
+    source_identity_path = (
+        args.source_identity_safety.expanduser().resolve()
+        if args.source_identity_safety
+        else None
+    )
+    if phase == 1 and reconciliation_path is None:
+        raise VClipError("Phase 1 requires --reconciliation")
+    if phase == 2 and source_identity_path is None:
+        raise VClipError("Phase 2 requires --source-identity-safety")
+    if write:
+        if args.backup_path:
+            print(f"Requested backup path: {args.backup_path.expanduser().resolve()}")
+        report = service.propagate(
+            phase=phase,
+            reconciliation_path=reconciliation_path,
+            source_identity_path=source_identity_path,
+            write=True,
+            backup_path=(
+                args.backup_path.expanduser().resolve() if args.backup_path else None
+            ),
+        )
+        print(f"Backup: {report.backup_path}")
+    else:
+        report = service.validate(
+            phase=phase,
+            reconciliation_path=reconciliation_path,
+            source_identity_path=source_identity_path,
+        )
+    text = format_propagate_report_text(report)
+    print()
+    print(text.rstrip())
+    if args.report:
+        report_path = args.report.expanduser().resolve()
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            json.dumps(report.as_dict(), indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        print(f"JSON report: {report_path}")
+    if args.text_report:
+        text_path = args.text_report.expanduser().resolve()
+        text_path.parent.mkdir(parents=True, exist_ok=True)
+        text_path.write_text(text, encoding="utf-8")
+        print(f"Text report: {text_path}")
+    if args.source_identity_report:
+        identity_path = args.source_identity_report.expanduser().resolve()
+        identity_path.parent.mkdir(parents=True, exist_ok=True)
+        identity_path.write_text(
+            json.dumps(report.source_identity, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        print(f"Source-identity report: {identity_path}")
+    return 0
+
+
 def _run_review_location_recover(args: argparse.Namespace) -> int:
     from ..geo import build_location_resolver, default_places_path
 
     repository, workflow = _catalog(args.db)
     places_path = (
-        args.places_file.expanduser().resolve()
-        if args.places_file
-        else default_places_path()
+        args.places_file.expanduser().resolve() if args.places_file else default_places_path()
     )
     location_resolver = build_location_resolver(
         repository,
@@ -768,18 +1199,14 @@ def _run_review_location_recover(args: argparse.Namespace) -> int:
         progress=_progress(args.quiet),
     ).run(
         input_root=args.input_root.expanduser().resolve(),
-        output_root=(
-            args.output_root.expanduser().resolve() if args.output_root else None
-        ),
+        output_root=(args.output_root.expanduser().resolve() if args.output_root else None),
         media_roots=[path.expanduser().resolve() for path in args.media_root],
         report_path=args.report.expanduser().resolve(),
         text_report_path=args.text_report.expanduser().resolve(),
         dry_run=args.dry_run,
         overwrite=args.overwrite,
         location_overrides=(
-            args.location_overrides.expanduser().resolve()
-            if args.location_overrides
-            else None
+            args.location_overrides.expanduser().resolve() if args.location_overrides else None
         ),
         forensic_jpg_exif=bool(args.forensic_jpg_exif),
     )
@@ -923,6 +1350,22 @@ def _run_canonicalize_entities(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_catalog_locations(args: argparse.Namespace) -> int:
+    _, workflow = _catalog(args.db)
+    report = workflow.location_inventory(
+        group_by=args.group_by,
+        city=args.city,
+        neighborhood=args.neighborhood,
+        market=args.market,
+        orientation=args.orientation,
+    )
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0
+    print(format_location_inventory_text(report))
+    return 0
+
+
 def _run_catalog_search(args: argparse.Namespace) -> int:
     _, workflow = _catalog(args.db)
     rows = workflow.search(
@@ -947,10 +1390,7 @@ def _run_catalog_search(args: argparse.Namespace) -> int:
             for item in explanation.get("contributions", []):
                 points = item.get("points", 0.0)
                 detail = f" ({item['detail']})" if item.get("detail") else ""
-                print(
-                    f"    +{points:.1f}  {item.get('kind')}  "
-                    f"{item.get('label')}{detail}"
-                )
+                print(f"    +{points:.1f}  {item.get('kind')}  {item.get('label')}{detail}")
     print(f"\nResults: {len(rows)}")
     return 0
 
@@ -992,9 +1432,7 @@ def _suggestion_from_path(path: Path) -> CollectionSuggestion:
 
 def _run_collection_publish(args: argparse.Namespace) -> int:
     _, workflow = _catalog(args.db)
-    result = CollectionService(workflow).publish(
-        _suggestion_from_path(args.suggestion)
-    )
+    result = CollectionService(workflow).publish(_suggestion_from_path(args.suggestion))
     print(json.dumps(result, indent=2))
     return 0
 
@@ -1011,6 +1449,234 @@ def _run_collection_materialize(args: argparse.Namespace) -> int:
     )
     print(f"Materialized {result['clip_count']} clip(s).")
     print(f"Output: {result['output_directory']}")
+    return 0
+
+
+def _run_publish_release(args: argparse.Namespace) -> int:
+    _, workflow = _catalog(args.db)
+    manifest = PackageReleaseService(workflow).build(
+        slug=args.slug,
+        version=args.version,
+        output_directory=args.output,
+        overwrite=args.overwrite,
+        dry_run=args.dry_run,
+    )
+    print()
+    print("Package release core ready")
+    print("--------------------------")
+    print(f"Package ID:  {manifest['package_id']}")
+    print(f"Collection:  {manifest['collection_slug']}")
+    print(f"Version:     {manifest['collection_version']}")
+    print(f"Clips:       {manifest['clip_count']}")
+    print(f"Duration:    {manifest['total_duration_seconds']}")
+    print(f"Size:        {manifest['total_size_bytes']}")
+    print(f"Status:      {manifest['status']}")
+    if args.dry_run:
+        print("Output:      (dry run — no files were written)")
+    else:
+        print(f"Output:      {manifest['manifest_path']}")
+    return 0
+
+
+def _run_publish_review_prepare(args: argparse.Namespace) -> int:
+    _, workflow = _catalog(args.db)
+    result = ReviewService(workflow).prepare(
+        slug=args.slug,
+        version=args.version,
+        release_root=args.release_root,
+        provider=args.provider,
+        model=args.model,
+        cache=args.cache,
+        refresh=args.refresh,
+        clip=args.clip,
+    )
+    print("Rights review prepared")
+    print("----------------------")
+    print(f"Collection:  {result['collection_slug']}")
+    print(f"Version:     {result['collection_version']}")
+    print(f"Clips:       {result['clip_count']}")
+    if args.clip is not None:
+        print(f"Clip:        {args.clip}")
+    print(f"Provider:    {result['provider']}")
+    print(f"Evidence:    {result['rights_evidence_path']}")
+    print(f"Review:      {result['rights_review_path']}")
+    if result["provider"] == "openai":
+        print(f"OpenAI reqs: {result['openai_requests']}")
+        print(f"Cached:      {result['cached_clips']}")
+        print(f"JPEG frames: {result['sampled_frame_count_total']}")
+        usage = result.get("usage") or {}
+        if usage:
+            cost = usage.get("estimated_total_cost_usd")
+            cost_text = "n/a" if cost is None else f"${cost:.4f}"
+            print(f"Tokens:      {usage.get('total_tokens') or 0}")
+            print(f"Est. cost:   {cost_text}")
+    print("Status:      review_prepared (human confirmation still required)")
+    return 0
+
+
+def _run_publish_review_list(args: argparse.Namespace) -> int:
+    _, workflow = _catalog(args.db)
+    result = ReviewService(workflow).list_clips(
+        slug=args.slug,
+        version=args.version,
+        release_root=args.release_root,
+        pending_only=args.pending_only,
+        risk=args.risk,
+    )
+    for row in result["rows"]:
+        caption = str(row["caption"]).strip()
+        if len(caption) > 70:
+            caption = caption[:67].rstrip() + "..."
+        print(
+            f"{row['sort_order']:02d}  {row['risk']:<7}  "
+            f"{row['human_review_status']:<14}  "
+            f"{row['classification']:<20}  {caption}"
+        )
+    totals = result["totals"]
+    print(
+        f"Total: {result['total']}  LOW={totals['LOW']} REVIEW={totals['REVIEW']} "
+        f"HIGH={totals['HIGH']} UNKNOWN={totals['UNKNOWN']}"
+    )
+    return 0
+
+
+def _run_publish_review_show(args: argparse.Namespace) -> int:
+    _, workflow = _catalog(args.db)
+    result = ReviewService(workflow).show(
+        slug=args.slug,
+        version=args.version,
+        release_root=args.release_root,
+        clip=args.clip,
+    )
+    print(f"Clip {result['sort_order']:02d}: {result['customer_filename']}")
+    print(f"Master path: {result['master_path']}")
+    print(f"Duration:    {result['duration_seconds']}")
+    print(f"Caption:     {result['caption']}")
+    print(f"Tags:        {', '.join(result['tags'])}")
+    print(f"Markets:     {', '.join(result['markets'])}")
+    print()
+    print(f"MACHINE EVIDENCE (triage only — {result['machine_risk']} risk)")
+    print("----------------------------------------------------")
+    for name, observation in result["machine_evidence"].items():
+        details = [f"status={observation.get('status')}"]
+        if "prominence" in observation:
+            details.append(f"prominence={observation.get('prominence')}")
+        if observation.get("candidates"):
+            details.append(f"candidates={observation['candidates']}")
+        if observation.get("notes"):
+            details.append(f"notes={observation['notes']}")
+        print(f"{name}: " + "  ".join(details))
+    print()
+    print("HUMAN CONFIRMED FACTS")
+    print("---------------------")
+    for name, value in result["human_confirmed_facts"].items():
+        print(f"{name}: {value}")
+    print()
+    print("HUMAN REVIEW")
+    print("------------")
+    print(json.dumps(result["human_review"], ensure_ascii=False, indent=2))
+    print()
+    print("CAPTURE PROVENANCE")
+    print("------------------")
+    print(json.dumps(result["capture_provenance"], ensure_ascii=False, indent=2))
+    print()
+    print("CLASSIFICATION (policy-derived, not legal advice)")
+    print("-------------------------------------------------")
+    print(json.dumps(result["classification"], ensure_ascii=False, indent=2))
+    return 0
+
+
+def _run_publish_review_confirm(args: argparse.Namespace) -> int:
+    _, workflow = _catalog(args.db)
+    result = ReviewService(workflow).confirm(
+        slug=args.slug,
+        version=args.version,
+        release_root=args.release_root,
+        clip=args.clip,
+        reviewed_by=args.reviewed_by,
+        accept_machine_evidence=args.accept_machine_evidence,
+        recognizable_people=args.recognizable_people,
+        trademarks=args.trademarks,
+        copyrighted_artwork=args.copyrighted_artwork,
+        identifiable_property=args.identifiable_property,
+        identifying_information=args.identifying_information,
+        professional_event_content=args.professional_event_content,
+        capture_provenance=args.capture_provenance,
+        notes=args.notes,
+        human_status=args.human_status,
+    )
+    print(f"Updated clip {result['sort_order']:02d}: {result['customer_filename']}")
+    print(f"Human review:   {result['human_review']['status']}")
+    print(f"Classification: {result['classification']['value']}")
+    for reason in result["classification"]["reasons"]:
+        print(f"  - {reason}")
+    return 0
+
+
+def _run_publish_review_validate(args: argparse.Namespace) -> int:
+    _, workflow = _catalog(args.db)
+    result = ReviewService(workflow).validate(
+        slug=args.slug,
+        version=args.version,
+        release_root=args.release_root,
+    )
+    print("Rights review validation")
+    print("------------------------")
+    print(f"Collection: {result['collection_slug']}")
+    print(f"Version:    {result['collection_version']}")
+    print(f"Clips:      {result['clip_count']}")
+    print(f"Status:     {result['status']}")
+    print(f"Report:     {result['path']}")
+    if result["failures"]:
+        print("Failures:")
+        for failure in result["failures"]:
+            print(f"  - {failure}")
+        return 2
+    return 0
+
+
+def _run_publish_content_prepare(args: argparse.Namespace) -> int:
+    _, workflow = _catalog(args.db)
+    result = ContentReadinessService(workflow).prepare(
+        slug=args.slug,
+        version=args.version,
+        release_root=args.release_root,
+    )
+    print()
+    print("Package content prepared")
+    print("------------------------")
+    print(f"Collection:       {result['collection_slug']}")
+    print(f"Version:          {result['collection_version']}")
+    print(f"Clips:            {result['clip_count']}")
+    print(f"Public metadata:  {result['public_metadata_path']}")
+    print(f"Rights review:    {result['rights_review_path']}")
+    print(f"Status:           {result['status']}")
+    print(result["note"])
+    return 0
+
+
+def _run_publish_content_validate(args: argparse.Namespace) -> int:
+    _, workflow = _catalog(args.db)
+    result = ContentReadinessService(workflow).validate(
+        slug=args.slug,
+        version=args.version,
+        release_root=args.release_root,
+    )
+    print()
+    print("Package content validation")
+    print("--------------------------")
+    print(f"Collection:             {result['collection_slug']}")
+    print(f"Version:                {result['collection_version']}")
+    print(f"Clips:                  {result['clip_count']}")
+    print(f"Public metadata ready:  {result['public_metadata_ready']}")
+    print(f"Rights review ready:    {result['rights_review_ready']}")
+    print(f"Status:                 {result['status']}")
+    print(f"Report:                 {result['path']}")
+    if result["failures"]:
+        print("Failures:")
+        for item in result["failures"]:
+            print(f"  - {item}")
+        return 2
     return 0
 
 

@@ -282,8 +282,12 @@ class CollectionService:
         elif mode == "hardlink":
             try:
                 os.link(source, destination)
-            except OSError:
-                shutil.copy2(source, destination)
+            except OSError as exc:
+                raise VClipError(
+                    f"Hardlinking failed from {source} to {destination}: {exc}. "
+                    "Source and destination may be on different filesystems. "
+                    "Choose --mode copy or --mode symlink explicitly."
+                ) from exc
         elif mode == "symlink":
             destination.symlink_to(source.resolve())
         else:  # pragma: no cover

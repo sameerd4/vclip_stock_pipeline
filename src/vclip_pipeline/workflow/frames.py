@@ -13,13 +13,13 @@ from ..packaging.media import probe_media
 from ..util import sha256_file, stable_id, utc_now
 from .models import FrameSampleSet
 
-
 SAMPLER_VERSION = "uniform-six-v1"
 DEFAULT_POSITIONS = (0.10, 0.25, 0.40, 0.60, 0.75, 0.90)
 
 
 @dataclass(frozen=True)
 class FrameSamplerConfig:
+    sampler_version: str = SAMPLER_VERSION
     positions: tuple[float, ...] = DEFAULT_POSITIONS
     max_dimension: int = 1024
     jpeg_quality: int = 3
@@ -51,7 +51,7 @@ class FrameSampler:
             raise VClipError(f"Could not determine export duration: {export_path}")
         checksum = export_sha256 or sha256_file(export_path)
         config_payload = {
-            "sampler_version": SAMPLER_VERSION,
+            "sampler_version": self.config.sampler_version,
             "positions": list(self.config.positions),
             "max_dimension": self.config.max_dimension,
             "jpeg_quality": self.config.jpeg_quality,

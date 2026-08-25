@@ -17,6 +17,14 @@ from .flight_location import (
     format_trajectory_diagnostics,
     resolve_flight_trajectory,
 )
+from .jpg_exif_same_shoot import (
+    EVIDENCE_SOURCE,
+    capture_dates_for_dji_sources,
+    dedupe_jpg_index,
+    index_jpg_photos,
+    infer_jpg_exif_same_shoot,
+    parse_dji_file_identity,
+)
 from .location_recovery import _has_gps, _is_unknown_session
 from .metadata import extract_gps_summary, is_usable_gps
 from .sidecars import normalized_stem, parse_srt_info
@@ -39,6 +47,8 @@ REASON_LABELS: dict[str, str] = {
     "multi_location_conflict": "Multiple distant location clusters",
     "place_resolution_failed": "Place lookup failed",
     "flight_gps_ready": "Flight GPS ready (run recover-locations)",
+    "jpg_exif_recovery_ready": "Same-shoot JPG EXIF available (run recover-locations)",
+    "jpg_exif_review_required": "Same-shoot JPGs found but association requires review",
     "insufficient_evidence": "Other / insufficient evidence",
 }
 
@@ -52,6 +62,8 @@ GROUP_REASON_LABELS: dict[str, str] = {
     "multi_location_conflict": "Multiple distant location clusters",
     "place_resolution_failed": "Place lookup failed",
     "flight_gps_ready": "Flight GPS ready (run recover-locations)",
+    "jpg_exif_recovery_ready": "Same-shoot JPG EXIF available (run recover-locations)",
+    "jpg_exif_review_required": "Same-shoot JPGs found; association needs review",
     "insufficient_evidence": "Other / insufficient evidence",
 }
 
@@ -94,6 +106,7 @@ class LocationDiagnosticsService:
         self.scan_roots = [Path(root) for root in (scan_roots or [Path("/Volumes")])]
         self.progress = progress
         self._srt_cache: dict[str, Any] = {}
+        self._jpg_index: dict[str, Any] = {}
 
     def run(self, *, verbose: bool = False) -> LocationDiagnosticsReport:
         runs = self.repository.list_stockify_runs(completed_only=True)
@@ -137,6 +150,7 @@ class LocationDiagnosticsService:
                 )
 
         volume_index = self._build_volume_index(needed_stems)
+        self._jpg_index = self._build_jpg_index(unknown_rows)
         report = LocationDiagnosticsReport(
             unknown_sessions=len(unknown_rows),
             clips_affected=sum(len(row["candidates"]) for row in unknown_rows),
@@ -220,16 +234,8 @@ class LocationDiagnosticsService:
             # Prefer live SRT re-parse so early (0,0) frames do not hide later GPS.
             live_gps = self._live_gps_from_srt(srt_disk_path)
             has_gps = bool(live_gps) or bool(source["has_gps"])
-            center_lat = (
-                live_gps["center_lat"]
-                if live_gps
-                else source["center_lat"]
-            )
-            center_lon = (
-                live_gps["center_lon"]
-                if live_gps
-                else source["center_lon"]
-            )
+            center_lat = live_gps["center_lat"] if live_gps else source["center_lat"]
+            center_lon = live_gps["center_lon"] if live_gps else source["center_lon"]
             if has_gps and is_usable_gps(center_lat, center_lon):
                 gps_points.append((float(center_lat), float(center_lon)))
                 trajectory_samples.append(
@@ -251,6 +257,21 @@ class LocationDiagnosticsService:
             if has_gps and not source["has_place"]:
                 place_failed += 1
 
+        jpg_exif = self._jpg_exif_for_sources(sources, has_direct_gps=bool(gps_points))
+        if not trajectory_samples:
+            for item in jpg_exif.get("inferences") or []:
+                trajectory_samples.append(
+                    TrajectorySample(
+                        latitude=float(item["latitude"]),
+                        longitude=float(item["longitude"]),
+                        source_key=str(item.get("source_stem") or item["source_basename"]),
+                        sample_count=int(item.get("sample_count") or 1),
+                        source=EVIDENCE_SOURCE,
+                        filename=str(item.get("source_basename") or ""),
+                        provenance=item,
+                    )
+                )
+
         trajectory = None
         if self.location_resolver is not None and trajectory_samples:
             trajectory = resolve_flight_trajectory(
@@ -271,6 +292,7 @@ class LocationDiagnosticsService:
             gps_points=gps_points,
             place_failed=place_failed,
             trajectory=trajectory,
+            jpg_exif=jpg_exif,
         )
         capture_date = session.get("capture_date") or "Unknown Date"
         return {
@@ -295,15 +317,14 @@ class LocationDiagnosticsService:
             "example_filenames": filenames[:EXAMPLE_FILENAME_LIMIT],
             "all_filenames": filenames,
             "filename_count": len(filenames),
+            "jpg_exif": jpg_exif,
             "trajectory": trajectory.diagnostics() if trajectory else None,
             "clip_details": [
                 {
                     "stock_clip_id": candidate.get("stock_clip_id"),
-                    "filename": candidate.get("source_filename")
-                    or candidate.get("source_name"),
+                    "filename": candidate.get("source_filename") or candidate.get("source_name"),
                     "media_path": candidate.get("source_media_path"),
-                    "srt_path": candidate.get("sidecar_path")
-                    or candidate.get("source_srt_path"),
+                    "srt_path": candidate.get("sidecar_path") or candidate.get("source_srt_path"),
                     "srt_match_method": candidate.get("source_srt_match_method"),
                 }
                 for candidate in candidates
@@ -328,6 +349,70 @@ class LocationDiagnosticsService:
             self.scan_roots,
             progress=self.progress,
         )
+
+    def _build_jpg_index(self, unknown_rows: list[dict[str, Any]]) -> dict[str, Any]:
+        sources: list[tuple[str | None, str | None]] = []
+        for row in unknown_rows:
+            for candidate in row.get("candidates") or []:
+                sources.append(
+                    (
+                        candidate.get("source_filename") or candidate.get("source_name"),
+                        candidate.get("source_media_path"),
+                    )
+                )
+        needed_dates = capture_dates_for_dji_sources(sources)
+        if not needed_dates:
+            return {}
+        self._announce(f"Indexing JPG/JPEG stills for {len(needed_dates)} capture date(s)")
+        return dedupe_jpg_index(index_jpg_photos(self.scan_roots, needed_dates=needed_dates))
+
+    def _jpg_exif_for_sources(
+        self,
+        sources: list[dict[str, Any]],
+        *,
+        has_direct_gps: bool,
+    ) -> dict[str, Any]:
+        inferences: list[dict[str, Any]] = []
+        dji_sources = 0
+        if has_direct_gps or not self._jpg_index:
+            return {
+                "status": "skipped_direct_gps" if has_direct_gps else "none",
+                "dji_source_count": 0,
+                "inferences": [],
+            }
+        for source in sources:
+            filename = str(source.get("filename") or "")
+            media_path = source.get("media_path")
+            identity = parse_dji_file_identity(filename)
+            if identity is None and media_path:
+                identity = parse_dji_file_identity(Path(str(media_path)).name)
+            if identity is None:
+                continue
+            dji_sources += 1
+            inference = infer_jpg_exif_same_shoot(
+                filename or Path(str(media_path)).name,
+                jpg_index=self._jpg_index,
+                media_path=str(media_path) if media_path else None,
+            )
+            if inference is not None:
+                inferences.append(inference.as_dict())
+        if not inferences:
+            status = "none"
+        elif any(
+            item.get("confidence") == "high" and not item.get("review_required")
+            for item in inferences
+        ):
+            status = "recovery_ready"
+        else:
+            status = "review_required"
+        return {
+            "status": status,
+            "dji_source_count": dji_sources,
+            "inferences": inferences,
+            "note": (
+                "JPG EXIF coordinates are inferred same-shoot evidence, never direct source GPS."
+            ),
+        }
 
     def _live_gps_from_srt(self, srt_path: str | None) -> dict[str, object] | None:
         if not srt_path:
@@ -366,17 +451,11 @@ def format_location_diagnostics_report(
         return lines
 
     width_sessions = max(
-        (
-            len(str(report.reason_counts.get(code, {}).get("sessions", 0)))
-            for code in REASON_ORDER
-        ),
+        (len(str(report.reason_counts.get(code, {}).get("sessions", 0))) for code in REASON_ORDER),
         default=1,
     )
     width_clips = max(
-        (
-            len(str(report.reason_counts.get(code, {}).get("clips", 0)))
-            for code in REASON_ORDER
-        ),
+        (len(str(report.reason_counts.get(code, {}).get("clips", 0))) for code in REASON_ORDER),
         default=1,
     )
     label_width = max(len(label) for label in REASON_LABELS.values())
@@ -431,18 +510,14 @@ def format_location_diagnostics_report(
             lines.append(
                 f"  Media currently found: {item['media_found']}/{item['source_file_count']}"
             )
-            lines.append(
-                f"  SRT currently found: {item['srt_found']}/{item['source_file_count']}"
-            )
+            lines.append(f"  SRT currently found: {item['srt_found']}/{item['source_file_count']}")
             lines.append(f"  Likely action: {item['likely_action']}")
             examples = item.get("example_filenames") or []
             total_names = int(item.get("filename_count") or len(examples))
             if examples:
                 shown = ", ".join(examples)
                 if total_names > len(examples):
-                    lines.append(
-                        f"  Example files: {shown} (+{total_names - len(examples)} more)"
-                    )
+                    lines.append(f"  Example files: {shown} (+{total_names - len(examples)} more)")
                 else:
                     lines.append(f"  Example files: {shown}")
 
@@ -479,6 +554,7 @@ def _classify_reason(
     gps_points: list[tuple[float, float]],
     place_failed: int,
     trajectory: Any | None = None,
+    jpg_exif: dict[str, Any] | None = None,
 ) -> str:
     # Only true city/region disagreement is a geographic conflict. Kilometer-scale
     # movement inside one city is normal drone flight behavior. Distant clusters
@@ -487,9 +563,20 @@ def _classify_reason(
         return "multi_location_conflict"
     if trajectory is not None and trajectory.status == "conflict":
         return "conflicting_gps"
-    if trajectory is not None and trajectory.status == "resolved":
+    if trajectory is not None and trajectory.status == "resolved" and gps_points:
         # Coherent flight place exists on disk; catalog just hasn't been updated.
         return "flight_gps_ready"
+    jpg_status = str((jpg_exif or {}).get("status") or "none")
+    if (
+        trajectory is not None
+        and trajectory.status == "resolved"
+        and jpg_status == "recovery_ready"
+    ):
+        return "jpg_exif_recovery_ready"
+    if jpg_status == "recovery_ready":
+        return "jpg_exif_recovery_ready"
+    if jpg_status == "review_required":
+        return "jpg_exif_review_required"
     if gps_points and place_failed >= max(1, len(gps_points)):
         return "place_resolution_failed"
     if source_count == 0:
@@ -541,8 +628,7 @@ def _unique_sources(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
             sources[key] = {
                 "key": key,
                 "stem": stem,
-                "filename": candidate.get("source_filename")
-                or candidate.get("source_name"),
+                "filename": candidate.get("source_filename") or candidate.get("source_name"),
                 "media_path": candidate.get("source_media_path"),
                 "srt_path": srt_path,
                 "ambiguous": ambiguous,
@@ -589,10 +675,7 @@ def _path_exists(value: str | None) -> bool:
 
 
 def _reason_totals(sessions: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
-    totals = {
-        code: {"sessions": 0, "clips": 0}
-        for code in REASON_ORDER
-    }
+    totals = {code: {"sessions": 0, "clips": 0} for code in REASON_ORDER}
     for item in sessions:
         code = item["reason_code"]
         totals[code]["sessions"] += 1
@@ -662,6 +745,10 @@ def _likely_action(
         return "resolve ambiguous SRT matches (find the correct sidecar set)"
     if reason_code == "flight_gps_ready":
         return "run vclip recover-locations to apply the coherent flight place"
+    if reason_code == "jpg_exif_recovery_ready":
+        return "run vclip recover-locations to apply inferred same-shoot JPG EXIF GPS"
+    if reason_code == "jpg_exif_review_required":
+        return "review same-shoot JPG EXIF association before applying recovery"
     if reason_code == "multi_location_conflict":
         return (
             "review geographic clusters; split the project into per-location "

@@ -21,6 +21,14 @@ from .flight_location import (
     TrajectorySample,
     resolve_flight_trajectory,
 )
+from .jpg_exif_same_shoot import (
+    EVIDENCE_SOURCE,
+    capture_dates_for_dji_sources,
+    dedupe_jpg_index,
+    index_jpg_photos,
+    infer_jpg_exif_same_shoot,
+    parse_dji_file_identity,
+)
 from .metadata import (
     extract_gps_summary,
     is_usable_gps,
@@ -51,6 +59,7 @@ class LocationRecoveryReport:
     resolved_by_srt_consensus: int = 0
     still_unknown: int = 0
     clips_recovered: int = 0
+    resolved_by_jpg_exif: int = 0
     review_xmls_rewritten: int = 0
     rewritten_review_xmls: list[str] = field(default_factory=list)
     runs: list[dict[str, Any]] = field(default_factory=list)
@@ -60,14 +69,21 @@ class LocationRecoveryReport:
 
 def format_location_recovery_report(report: LocationRecoveryReport) -> list[str]:
     """Human-readable aggregate summary lines for the CLI."""
-    return [
+    lines = [
         f"Stockify runs scanned:       {report.stockify_runs_scanned}",
         f"Unknown sessions before:     {report.unknown_sessions_before}",
         f"Resolved by SRT consensus:   {report.resolved_by_srt_consensus}",
-        f"Still unknown:               {report.still_unknown}",
-        f"Clips recovered:             {report.clips_recovered}",
-        f"Review XMLs rewritten:       {report.review_xmls_rewritten}",
     ]
+    if report.resolved_by_jpg_exif:
+        lines.append(f"Resolved by JPG EXIF:        {report.resolved_by_jpg_exif}")
+    lines.extend(
+        [
+            f"Still unknown:               {report.still_unknown}",
+            f"Clips recovered:             {report.clips_recovered}",
+            f"Review XMLs rewritten:       {report.review_xmls_rewritten}",
+        ]
+    )
+    return lines
 
 
 class LocationRecoveryService:
@@ -89,6 +105,7 @@ class LocationRecoveryService:
         self.progress = progress
         self._srt_cache: dict[str, Any] = {}
         self._volume_index: VolumeFileIndex = VolumeFileIndex()
+        self._jpg_index: dict[str, Any] | None = None
 
     def run(
         self,
@@ -98,6 +115,8 @@ class LocationRecoveryService:
         rewrite_review_xml: bool,
         report_path: Path | None,
         refresh_resolved: bool = False,
+        enable_jpg_exif: bool = True,
+        session_id: str | None = None,
     ) -> LocationRecoveryReport:
         if run_id:
             runs = [self.repository.get_stockify_run(run_id)]
@@ -112,16 +131,19 @@ class LocationRecoveryService:
         )
         self._announce(
             f"Scanning {len(runs)} Stockify run(s) for "
-            + (
-                "session location refresh."
-                if refresh_resolved
-                else "Unknown Location sessions."
-            )
+            + ("session location refresh." if refresh_resolved else "Unknown Location sessions.")
         )
         self._volume_index = self._build_volume_index_for_runs(
             runs,
             include_resolved=refresh_resolved,
         )
+        self._jpg_index = None
+        if enable_jpg_exif:
+            self._jpg_index = self._build_jpg_index_for_runs(
+                runs,
+                include_resolved=refresh_resolved,
+                session_id=session_id,
+            )
 
         for run in runs:
             try:
@@ -130,6 +152,8 @@ class LocationRecoveryService:
                     dry_run=dry_run,
                     rewrite_review_xml=rewrite_review_xml,
                     refresh_resolved=refresh_resolved,
+                    enable_jpg_exif=enable_jpg_exif,
+                    session_id=session_id,
                 )
             except Exception as exc:
                 run_id_value = str(run.get("id") or "unknown")
@@ -141,6 +165,7 @@ class LocationRecoveryService:
                     "resolved_by_srt_consensus": 0,
                     "still_unknown": 0,
                     "clips_recovered": 0,
+                    "resolved_by_jpg_exif": 0,
                     "rewritten_review_xml": None,
                     "sessions": [],
                     "warnings": [warning],
@@ -148,11 +173,10 @@ class LocationRecoveryService:
                 }
             report.runs.append(run_summary)
             report.unknown_sessions_before += int(run_summary["unknown_sessions_before"])
-            report.resolved_by_srt_consensus += int(
-                run_summary["resolved_by_srt_consensus"]
-            )
+            report.resolved_by_srt_consensus += int(run_summary["resolved_by_srt_consensus"])
             report.still_unknown += int(run_summary["still_unknown"])
             report.clips_recovered += int(run_summary["clips_recovered"])
+            report.resolved_by_jpg_exif += int(run_summary.get("resolved_by_jpg_exif") or 0)
             report.sessions.extend(run_summary["sessions"])
             report.warnings.extend(run_summary.get("warnings") or [])
             rewritten = run_summary.get("rewritten_review_xml")
@@ -176,6 +200,8 @@ class LocationRecoveryService:
         dry_run: bool,
         rewrite_review_xml: bool,
         refresh_resolved: bool = False,
+        enable_jpg_exif: bool = True,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         """Recover unknown sessions for one Stockify run without cross-run merging."""
         resolved_run_id = str(run["id"])
@@ -192,12 +218,16 @@ class LocationRecoveryService:
 
         unknown = [session for session in sessions if _is_unknown_session(session)]
         targets = list(sessions) if refresh_resolved else unknown
+        if session_id:
+            targets = [session for session in targets if str(session["id"]) == session_id]
+            unknown = [session for session in unknown if str(session["id"]) == session_id]
         summary: dict[str, Any] = {
             "stockify_run_id": resolved_run_id,
             "unknown_sessions_before": len(unknown),
             "resolved_by_srt_consensus": 0,
             "still_unknown": 0,
             "clips_recovered": 0,
+            "resolved_by_jpg_exif": 0,
             "rewritten_review_xml": None,
             "sessions": [],
             "warnings": [],
@@ -221,11 +251,10 @@ class LocationRecoveryService:
                     # Keep nearby/sibling evidence inside this run only.
                     all_sessions=sessions,
                     all_candidates=candidates,
+                    enable_jpg_exif=enable_jpg_exif,
                 )
             except Exception as exc:
-                warning = (
-                    f"{resolved_run_id}: session {session_id} recovery failed: {exc}"
-                )
+                warning = f"{resolved_run_id}: session {session_id} recovery failed: {exc}"
                 self._announce(warning)
                 summary["warnings"].append(warning)
                 outcome = {
@@ -256,8 +285,7 @@ class LocationRecoveryService:
                     )
                 except Exception as exc:
                     warning = (
-                        f"{resolved_run_id}: session {outcome['session_id']} "
-                        f"persist failed: {exc}"
+                        f"{resolved_run_id}: session {outcome['session_id']} persist failed: {exc}"
                     )
                     summary["warnings"].append(warning)
                     outcome["status"] = "error"
@@ -266,6 +294,8 @@ class LocationRecoveryService:
                     continue
             summary["resolved_by_srt_consensus"] += 1
             summary["clips_recovered"] += len(outcome["candidate_updates"])
+            if outcome.get("jpg_exif_used"):
+                summary["resolved_by_jpg_exif"] += 1
 
         persisted = [item for item in outcomes if item["status"] == "resolved"]
         rename_events, rename_projects = _rename_maps_for_outcomes(
@@ -278,9 +308,7 @@ class LocationRecoveryService:
         if refresh_resolved:
             # After refresh, recount unknowns from outcomes + untouched sessions.
             resolved_ids = {
-                str(item["session_id"])
-                for item in outcomes
-                if item.get("status") == "resolved"
+                str(item["session_id"]) for item in outcomes if item.get("status") == "resolved"
             }
             still = 0
             for session in sessions:
@@ -292,16 +320,14 @@ class LocationRecoveryService:
         else:
             summary["still_unknown"] = max(
                 0,
-                summary["unknown_sessions_before"]
-                - summary["resolved_by_srt_consensus"],
+                summary["unknown_sessions_before"] - summary["resolved_by_srt_consensus"],
             )
 
         if rewrite_review_xml and (rename_events or rename_projects):
             output_xml = Path(str(run.get("output_xml_path") or ""))
             if not output_xml.is_file():
                 summary["warnings"].append(
-                    f"{resolved_run_id}: cannot rewrite review XML; "
-                    f"file missing: {output_xml}"
+                    f"{resolved_run_id}: cannot rewrite review XML; file missing: {output_xml}"
                 )
             elif dry_run:
                 summary["rewritten_review_xml"] = str(output_xml)
@@ -341,6 +367,7 @@ class LocationRecoveryService:
         candidates: list[dict[str, Any]],
         all_sessions: list[dict[str, Any]],
         all_candidates: list[dict[str, Any]],
+        enable_jpg_exif: bool = True,
     ) -> dict[str, Any]:
         identity = FlightIdentity(
             run_id=str(session.get("run_id") or ""),
@@ -351,6 +378,7 @@ class LocationRecoveryService:
             candidates=candidates,
             session_candidates=candidates,
             all_candidates=all_candidates,
+            enable_jpg_exif=enable_jpg_exif,
         )
         gps_observations = [
             {
@@ -423,15 +451,32 @@ class LocationRecoveryService:
         if location.get("timezone") is None and session.get("timezone"):
             location["timezone"] = session.get("timezone")
         name_corroboration = _name_corroborates_place(candidates, location)
+        gps_kind, jpg_payloads, has_direct_gps = _gps_provenance(trajectory_samples)
         evidence_sources = sorted(
             {
                 *list(location.get("evidence_sources") or []),
                 "flight_session_trajectory",
                 *(["name_hint_corroboration"] if name_corroboration else []),
                 *(["nearby_session"] if nearby_support else []),
+                *([EVIDENCE_SOURCE] if jpg_payloads else []),
             }
         )
+        if jpg_payloads and not has_direct_gps:
+            evidence_sources = [source for source in evidence_sources if source != "srt_gps"]
+            if EVIDENCE_SOURCE not in evidence_sources:
+                evidence_sources.append(EVIDENCE_SOURCE)
+            evidence_sources = sorted(set(evidence_sources))
         location["evidence_sources"] = evidence_sources
+        location["gps_kind"] = gps_kind
+        location["direct_source_gps"] = has_direct_gps
+        if jpg_payloads:
+            location["jpg_exif_same_shoot"] = {
+                "inferences": jpg_payloads,
+                "note": (
+                    "Coordinates are inferred from same-shoot JPG EXIF GPS; not direct source GPS."
+                ),
+            }
+            _apply_jpg_confidence(location, jpg_payloads, has_direct_gps=has_direct_gps)
         location["recovery"] = {
             "method": "flight_trajectory",
             "confidence": location.get("confidence") or "medium",
@@ -439,10 +484,13 @@ class LocationRecoveryService:
             "contributing_clip_ids": trajectory.contributing_clip_ids,
             "contributing_source_keys": trajectory.contributing_source_keys,
             "evidence_sources": evidence_sources,
+            "gps_kind": gps_kind,
+            "direct_source_gps": has_direct_gps,
             "nearby_session_ids": [item["session_id"] for item in nearby_support],
             "flight_id": identity.flight_id,
             "recovered_at": utc_now(),
             "trajectory": trajectory.diagnostics(),
+            **({"jpg_exif_same_shoot": location["jpg_exif_same_shoot"]} if jpg_payloads else {}),
         }
 
         capture = dict(session.get("capture") or {})
@@ -540,6 +588,8 @@ class LocationRecoveryService:
             "project_renames": project_renames,
             "trajectory": trajectory.diagnostics(),
             "nearby_support": nearby_support,
+            "jpg_exif_used": bool(jpg_payloads),
+            "gps_kind": gps_kind,
         }
 
     def _trajectory_samples_for_session(
@@ -548,6 +598,7 @@ class LocationRecoveryService:
         candidates: list[dict[str, Any]],
         session_candidates: list[dict[str, Any]],
         all_candidates: list[dict[str, Any]],
+        enable_jpg_exif: bool = True,
     ) -> list[TrajectorySample]:
         """Collect usable GPS from each source recording in the flight/session."""
         samples: list[TrajectorySample] = []
@@ -556,16 +607,14 @@ class LocationRecoveryService:
             source_key = _source_key(candidate)
             clip_id = str(candidate["stock_clip_id"])
             filename = (
-                candidate.get("source_filename")
-                or candidate.get("source_name")
-                or source_key
+                candidate.get("source_filename") or candidate.get("source_name") or source_key
             )
 
             # Prefer full-sidecar usable GPS so early (0,0) windows still contribute.
             summary = self._gps_from_srt_path(candidate, prefer_full_sidecar=True)
             if summary is None:
                 existing = candidate.get("location") or {}
-                if _has_gps(existing):
+                if _has_gps(existing) and _existing_gps_is_direct(existing):
                     summary = {
                         "lat": float(existing["center_lat"]),
                         "lon": float(existing["center_lon"]),
@@ -587,7 +636,7 @@ class LocationRecoveryService:
                         )
                         if sibling_summary is None:
                             sibling_loc = sibling.get("location") or {}
-                            if _has_gps(sibling_loc):
+                            if _has_gps(sibling_loc) and _existing_gps_is_direct(sibling_loc):
                                 sibling_summary = {
                                     "lat": float(sibling_loc["center_lat"]),
                                     "lon": float(sibling_loc["center_lon"]),
@@ -597,12 +646,12 @@ class LocationRecoveryService:
                         if sibling_summary is not None:
                             summary = sibling_summary
                             break
+            if summary is None and enable_jpg_exif:
+                summary = self._jpg_exif_observation(candidate)
             if summary is None:
                 continue
             path_token = str(
-                candidate.get("sidecar_path")
-                or candidate.get("source_srt_path")
-                or source_key
+                candidate.get("sidecar_path") or candidate.get("source_srt_path") or source_key
             )
             dedupe_key = f"{source_key}:{path_token}"
             if dedupe_key in seen_source_paths and any(
@@ -619,6 +668,7 @@ class LocationRecoveryService:
                         sample_count=int(summary.get("sample_count") or 1),
                         source=str(summary.get("source") or "srt"),
                         filename=str(filename),
+                        provenance=summary.get("jpg_exif_same_shoot"),
                     )
                 )
                 continue
@@ -633,6 +683,7 @@ class LocationRecoveryService:
                     sample_count=int(summary.get("sample_count") or 1),
                     source=str(summary.get("source") or "srt"),
                     filename=str(filename),
+                    provenance=summary.get("jpg_exif_same_shoot"),
                 )
             )
         return samples
@@ -654,11 +705,7 @@ class LocationRecoveryService:
         except OSError:
             return False
         start_raw = candidate.get("final_start") or candidate.get("proposed_start") or "0s"
-        duration_raw = (
-            candidate.get("final_duration")
-            or candidate.get("proposed_duration")
-            or "0s"
-        )
+        duration_raw = candidate.get("final_duration") or candidate.get("proposed_duration") or "0s"
         try:
             start = parse_time(str(start_raw))
             duration = parse_time(str(duration_raw))
@@ -704,13 +751,78 @@ class LocationRecoveryService:
             progress=self.progress,
         )
 
+    def _build_jpg_index_for_runs(
+        self,
+        runs: list[dict[str, Any]],
+        *,
+        include_resolved: bool = False,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        sources: list[tuple[str | None, str | None]] = []
+        for run in runs:
+            run_id = str(run["id"])
+            sessions = {
+                str(session["id"])
+                for session in self.repository.sessions_for_run(run_id)
+                if (include_resolved or _is_unknown_session(session))
+                and (session_id is None or str(session["id"]) == session_id)
+            }
+            if not sessions:
+                continue
+            for candidate in self.repository.candidates_for_run(
+                run_id,
+                accepted_only=True,
+            ):
+                if str(candidate.get("session_id") or "") not in sessions:
+                    continue
+                if _has_gps(candidate.get("location") or {}) and _existing_gps_is_direct(
+                    candidate.get("location") or {}
+                ):
+                    continue
+                sources.append(
+                    (
+                        candidate.get("source_filename") or candidate.get("source_name"),
+                        candidate.get("source_media_path"),
+                    )
+                )
+        needed_dates = capture_dates_for_dji_sources(sources)
+        if not needed_dates:
+            return {}
+        self._announce(
+            f"Indexing JPG/JPEG stills for {len(needed_dates)} capture date(s) "
+            f"across {len(self.scan_roots)} scan root(s)"
+        )
+        return dedupe_jpg_index(index_jpg_photos(self.scan_roots, needed_dates=needed_dates))
+
+    def _jpg_exif_observation(self, candidate: dict[str, Any]) -> dict[str, Any] | None:
+        if not self._jpg_index:
+            return None
+        basename = str(candidate.get("source_filename") or candidate.get("source_name") or "")
+        if parse_dji_file_identity(basename) is None and not parse_dji_file_identity(
+            Path(str(candidate.get("source_media_path") or "")).name
+        ):
+            return None
+        inference = infer_jpg_exif_same_shoot(
+            basename or Path(str(candidate.get("source_media_path") or "")).name,
+            jpg_index=self._jpg_index,
+            media_path=candidate.get("source_media_path"),
+        )
+        if inference is None:
+            return None
+        observation = inference.as_source_observation()
+        return {
+            "lat": float(observation["lat"]),
+            "lon": float(observation["lon"]),
+            "sample_count": int(observation.get("sample_count") or 1),
+            "source": EVIDENCE_SOURCE,
+            "jpg_exif_same_shoot": observation.get("jpg_exif_same_shoot"),
+        }
+
     def _resolve_srt_path(self, candidate: dict[str, Any]) -> str | None:
         """Catalog sidecar, media sibling, then volume-scan match."""
         catalog = candidate.get("sidecar_path") or candidate.get("source_srt_path")
         stem = _candidate_stem(candidate)
-        volume_matches = (
-            self._volume_index.srt_by_stem.get(stem) or [] if stem else []
-        )
+        volume_matches = self._volume_index.srt_by_stem.get(stem) or [] if stem else []
         return first_existing_path(
             catalog,
             sibling_srt_for_media(candidate.get("source_media_path")),
@@ -742,13 +854,9 @@ class LocationRecoveryService:
                 allow_full_sidecar_fallback=True,
             )
         else:
-            start_raw = (
-                candidate.get("final_start") or candidate.get("proposed_start") or "0s"
-            )
+            start_raw = candidate.get("final_start") or candidate.get("proposed_start") or "0s"
             duration_raw = (
-                candidate.get("final_duration")
-                or candidate.get("proposed_duration")
-                or "0s"
+                candidate.get("final_duration") or candidate.get("proposed_duration") or "0s"
             )
             try:
                 start = parse_time(str(start_raw))
@@ -768,9 +876,7 @@ class LocationRecoveryService:
             "lat": float(summary["center_lat"]),
             "lon": float(summary["center_lon"]),
             "radius_meters": summary.get("radius_meters"),
-            "sample_count": summary.get("valid_sample_count")
-            or summary.get("sample_count")
-            or 0,
+            "sample_count": summary.get("valid_sample_count") or summary.get("sample_count") or 0,
             "source": "srt_full" if prefer_full_sidecar else "srt_window",
             "srt_path": srt_path,
         }
@@ -791,8 +897,7 @@ class LocationRecoveryService:
         media_ids = {
             candidate.get("source_media_id")
             for candidate in all_candidates
-            if candidate.get("session_id") == session.get("id")
-            and candidate.get("source_media_id")
+            if candidate.get("session_id") == session.get("id") and candidate.get("source_media_id")
         }
 
         for other in all_sessions:
@@ -809,8 +914,7 @@ class LocationRecoveryService:
                 except TypeError:
                     gap = abs(
                         (
-                            session_time.replace(tzinfo=None)
-                            - other_time.replace(tzinfo=None)
+                            session_time.replace(tzinfo=None) - other_time.replace(tzinfo=None)
                         ).total_seconds()
                     )
                 if gap > max_gap:
@@ -924,9 +1028,7 @@ def _rename_maps_for_outcomes(
     rename_events: dict[str, str] = {}
     rename_projects: dict[str, str] = {}
     for outcome in outcomes:
-        session = next(
-            item for item in sessions if item["id"] == outcome["session_id"]
-        )
+        session = next(item for item in sessions if item["id"] == outcome["session_id"])
         old_event = str(session.get("generated_event_name") or "")
         new_event = str(outcome["generated_event_name"])
         if old_event and new_event and old_event != new_event:
@@ -990,7 +1092,7 @@ def rewrite_review_xml_names(
             continue
         for old, new in sorted(label_prefixes.items(), key=lambda item: len(item[0]), reverse=True):
             if name.startswith(f"{old} — "):
-                node.set("name", f"{new}{name[len(old):]}")
+                node.set("name", f"{new}{name[len(old) :]}")
                 changed += 1
                 break
     if changed:
@@ -1011,6 +1113,74 @@ def _is_unknown_session(session: dict[str, Any]) -> bool:
 
 def _has_gps(location: dict[str, Any]) -> bool:
     return is_usable_gps(location.get("center_lat"), location.get("center_lon"))
+
+
+def _existing_gps_is_direct(location: dict[str, Any]) -> bool:
+    """True when catalog GPS came from video/SRT, not inferred JPG EXIF."""
+    if location.get("direct_source_gps") is False:
+        return False
+    gps_kind = str(location.get("gps_kind") or "")
+    if gps_kind.startswith("inferred_"):
+        return False
+    sources = {str(item) for item in (location.get("evidence_sources") or []) if item}
+    if EVIDENCE_SOURCE in sources and "srt_gps" not in sources:
+        return False
+    return True
+
+
+def _gps_provenance(
+    samples: list[TrajectorySample],
+) -> tuple[str, list[dict[str, Any]], bool]:
+    jpg_payloads: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    has_direct = False
+    has_jpg = False
+    for sample in samples:
+        if sample.source == EVIDENCE_SOURCE:
+            has_jpg = True
+            payload = sample.provenance
+            if isinstance(payload, dict):
+                key = str(payload.get("source_basename") or sample.source_key)
+                if key not in seen:
+                    seen.add(key)
+                    jpg_payloads.append(payload)
+            continue
+        if sample.source in {
+            "srt",
+            "srt_full",
+            "srt_window",
+            "existing_candidate_srt_gps",
+            "same_asset_sibling_srt_gps",
+        }:
+            has_direct = True
+    if has_direct and has_jpg:
+        gps_kind = "mixed"
+    elif has_jpg:
+        gps_kind = "inferred_jpg_exif_same_shoot"
+    else:
+        gps_kind = "srt_gps"
+    return gps_kind, jpg_payloads, has_direct
+
+
+def _apply_jpg_confidence(
+    location: dict[str, Any],
+    jpg_payloads: list[dict[str, Any]],
+    *,
+    has_direct_gps: bool,
+) -> None:
+    """Keep MEDIUM/LOW JPG associations from masquerading as direct GPS."""
+    if has_direct_gps:
+        return
+    confidences = {str(item.get("confidence") or "low") for item in jpg_payloads}
+    review_required = any(bool(item.get("review_required")) for item in jpg_payloads)
+    if "low" in confidences:
+        location["confidence"] = "low"
+        review_required = True
+    elif "medium" in confidences:
+        if location.get("confidence") == "high":
+            location["confidence"] = "medium"
+        review_required = True
+    location["review_required"] = bool(location.get("review_required")) or review_required
 
 
 def _candidate_stem(candidate: dict[str, Any]) -> str:

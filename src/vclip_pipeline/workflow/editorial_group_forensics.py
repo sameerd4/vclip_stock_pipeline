@@ -8,8 +8,9 @@ one city/metro, without forcing event splits from spatial clusters.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
-from typing import Any, Iterable
+from typing import Any
 
 from ..geo import LocationResolver, resolve_place
 from ..stockify.jpg_exif_same_shoot import EVIDENCE_SOURCE as JPG_EXIF_EVIDENCE_SOURCE
@@ -59,6 +60,25 @@ _SEATTLE_METRO_CITIES = frozenset(
 
 METRO_RADIUS_M = 55_000.0
 REGION_RADIUS_M = 200_000.0
+
+# Admin areas stored in the `state` field that are Canadian, not US states.
+_CANADA_ADMIN_AREAS = frozenset(
+    {
+        "british columbia",
+        "alberta",
+        "ontario",
+        "quebec",
+        "manitoba",
+        "saskatchewan",
+        "nova scotia",
+        "new brunswick",
+        "newfoundland and labrador",
+        "prince edward island",
+        "northwest territories",
+        "yukon",
+        "nunavut",
+    }
+)
 
 
 @dataclass
@@ -410,10 +430,11 @@ def classify_group_coherence(
             "multiple_cities_same_region:"
             + ",".join(sorted(_display_city_state(c, s) for c, s in city_keys))
         )
-        # Broad region label only — not a city claim.
+        # Broad region label only — not a city claim. Keep GPS/city evidence
+        # untouched; only the editorial country suffix is derived here.
         return (
             "region",
-            f"{_title(state)}, United States" if state else "United States",
+            _region_public_label(located, state),
             "region",
             contradictions,
         )
@@ -846,6 +867,60 @@ def _display_city_state(city: str | None, state: str | None) -> str:
     if city and state:
         return f"{_title(city)}, {_title(state)}"
     return _title(city or state or "Unknown")
+
+
+def country_for_admin_area(
+    state: str | None,
+    *,
+    explicit_country: str | None = None,
+    located: Iterable[SourceGeoEvidence] | None = None,
+    countries: Iterable[str | None] | None = None,
+) -> str:
+    """Country for a region/admin label without altering GPS evidence.
+
+    Prefer a unanimous country on located sources, then an explicit country,
+    then Canadian vs US admin-area membership. Does not invent coordinates.
+    """
+    observed: set[str] = set()
+    if located is not None:
+        for item in located:
+            canonical = _canonical_country(item.country)
+            if canonical:
+                observed.add(canonical)
+    if countries is not None:
+        for value in countries:
+            canonical = _canonical_country(value)
+            if canonical:
+                observed.add(canonical)
+    if len(observed) == 1:
+        return next(iter(observed))
+    canonical_explicit = _canonical_country(explicit_country)
+    if canonical_explicit:
+        return canonical_explicit
+    if _norm(state) in _CANADA_ADMIN_AREAS:
+        return "Canada"
+    return "United States"
+
+
+def _region_public_label(
+    located: list[SourceGeoEvidence],
+    state: str | None,
+) -> str:
+    country = country_for_admin_area(state, located=located)
+    if state:
+        return f"{_title(state)}, {country}"
+    return country
+
+
+def _canonical_country(value: str | None) -> str | None:
+    normalized = _norm(value)
+    if not normalized:
+        return None
+    if normalized in {"canada", "ca"}:
+        return "Canada"
+    if normalized in {"united states", "united states of america", "usa", "us"}:
+        return "United States"
+    return _title(value)
 
 
 def _stale_event_label_contradictions(

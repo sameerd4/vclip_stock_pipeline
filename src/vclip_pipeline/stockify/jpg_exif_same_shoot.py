@@ -9,10 +9,11 @@ from __future__ import annotations
 import os
 import re
 import struct
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from .metadata import haversine_meters, is_usable_gps, parse_dji_filename_datetime
 from .sidecars import normalized_stem
@@ -80,6 +81,8 @@ class JpgExifPhoto:
     altitude: float | None = None
     camera_model: str | None = None
     exif_datetime: datetime | None = None
+    # Other filesystem copies of the same DJI still (archive vs FCP Original Media).
+    alternate_paths: list[Path] = field(default_factory=list)
 
     @property
     def has_gps(self) -> bool:
@@ -97,6 +100,7 @@ class JpgExifPhoto:
                 self.exif_datetime.isoformat(sep=" ") if self.exif_datetime else None
             ),
             "has_gps": self.has_gps,
+            "alternate_paths": [str(path) for path in self.alternate_paths],
         }
 
 
@@ -112,6 +116,7 @@ class JpgEvidenceLink:
     sequence_delta: int | None
     time_delta_seconds: float | None
     role: str
+    duplicate_paths: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -136,9 +141,7 @@ class JpgExifInference:
         return {
             "source_basename": self.source_basename,
             "source_stem": self.source_stem,
-            "source_identity": (
-                self.source_identity.as_dict() if self.source_identity else None
-            ),
+            "source_identity": (self.source_identity.as_dict() if self.source_identity else None),
             "latitude": self.latitude,
             "longitude": self.longitude,
             "confidence": self.confidence,
@@ -149,8 +152,7 @@ class JpgExifInference:
             "camera_models": list(self.camera_models),
             "sample_count": self.sample_count,
             "note": (
-                "Coordinates are inferred from same-shoot JPG EXIF GPS; "
-                "not direct source GPS."
+                "Coordinates are inferred from same-shoot JPG EXIF GPS; not direct source GPS."
             ),
         }
 
@@ -178,9 +180,7 @@ def parse_dji_file_identity(value: str | None) -> DjiFileIdentity | None:
     if not match:
         return None
     try:
-        captured = datetime.strptime(
-            match.group("date") + match.group("time"), "%Y%m%d%H%M%S"
-        )
+        captured = datetime.strptime(match.group("date") + match.group("time"), "%Y%m%d%H%M%S")
         sequence = int(match.group("seq"))
     except ValueError:
         return None
@@ -240,9 +240,81 @@ def index_jpg_photos(
                     exif_datetime=exif_dt,
                 )
                 by_date.setdefault(identity.date or "", []).append(photo)
-    for date, photos in by_date.items():
+    for _date, photos in by_date.items():
         photos.sort(key=lambda item: (item.identity.sequence, str(item.path)))
     return by_date
+
+
+def logical_photo_key(identity: DjiFileIdentity) -> str:
+    """Identity for one DJI still, independent of archive vs FCP-copy path."""
+    return identity.stem.casefold()
+
+
+def dedupe_jpg_photos(photos: Iterable[JpgExifPhoto]) -> list[JpgExifPhoto]:
+    """Keep one GPS observation per DJI still identity.
+
+    Duplicate physical copies (raw archive + FCP Original Media) must not
+    inflate sample counts or same-day coherence.
+    """
+    groups: dict[str, list[JpgExifPhoto]] = {}
+    for photo in photos:
+        groups.setdefault(logical_photo_key(photo.identity), []).append(photo)
+    result: list[JpgExifPhoto] = []
+    for items in groups.values():
+        ranked = sorted(
+            items,
+            key=lambda photo: (
+                0 if photo.has_gps else 1,
+                _fcpbundle_rank(photo.path),
+                str(photo.path),
+            ),
+        )
+        keeper = ranked[0]
+        extras = [
+            path
+            for item in ranked[1:]
+            for path in (item.path, *item.alternate_paths)
+            if path != keeper.path
+        ]
+        if extras:
+            keeper = JpgExifPhoto(
+                path=keeper.path,
+                identity=keeper.identity,
+                latitude=keeper.latitude,
+                longitude=keeper.longitude,
+                altitude=keeper.altitude,
+                camera_model=keeper.camera_model,
+                exif_datetime=keeper.exif_datetime,
+                alternate_paths=list(dict.fromkeys(extras)),
+            )
+        result.append(keeper)
+    result.sort(key=lambda item: (item.identity.sequence, str(item.path)))
+    return result
+
+
+def dedupe_jpg_index(
+    jpg_index: dict[str, list[JpgExifPhoto]],
+) -> dict[str, list[JpgExifPhoto]]:
+    return {date: dedupe_jpg_photos(photos) for date, photos in jpg_index.items()}
+
+
+def _fcpbundle_rank(path: Path) -> int:
+    """Prefer a raw-archive copy over the same still inside an FCP bundle."""
+    return 1 if any(part.endswith(".fcpbundle") for part in path.parts) else 0
+
+
+def capture_dates_for_dji_sources(
+    sources: Iterable[tuple[str | None, str | None]],
+) -> set[str]:
+    """Collect YYYY-MM-DD dates from DJI video basenames/paths."""
+    dates: set[str] = set()
+    for basename, media_path in sources:
+        identity = parse_dji_file_identity(basename)
+        if identity is None and media_path:
+            identity = parse_dji_file_identity(Path(media_path).name)
+        if identity is not None and identity.date:
+            dates.add(identity.date)
+    return dates
 
 
 def prune_media_walk_dirnames(dirpath: str | Path, dirnames: list[str]) -> list[str]:
@@ -288,7 +360,7 @@ def infer_jpg_exif_same_shoot(
 
     candidates = [
         photo
-        for photo in jpg_index.get(identity.date or "", [])
+        for photo in dedupe_jpg_photos(jpg_index.get(identity.date or "", []))
         if photo.has_gps
     ]
     if not candidates:
@@ -320,8 +392,7 @@ def infer_jpg_exif_same_shoot(
                 confidence="high",
                 review_required=False,
                 association_reason=(
-                    "bracketing_photos_geographically_coherent"
-                    f"|spread_m={spread:.1f}"
+                    f"bracketing_photos_geographically_coherent|spread_m={spread:.1f}"
                 ),
                 evidence_photos=evidence,
                 camera_models=_camera_models(evidence),
@@ -331,29 +402,21 @@ def infer_jpg_exif_same_shoot(
     ranked = sorted(
         candidates,
         key=lambda photo: (
-            abs(photo.identity.sequence - identity.sequence)
-            if identity.sequence >= 0
-            else 10_000,
+            abs(photo.identity.sequence - identity.sequence) if identity.sequence >= 0 else 10_000,
             abs((photo.identity.capture_datetime - identity.capture_datetime).total_seconds()),
             str(photo.path),
         ),
     )
     nearest = ranked[0]
     seq_delta = (
-        abs(nearest.identity.sequence - identity.sequence)
-        if identity.sequence >= 0
-        else None
+        abs(nearest.identity.sequence - identity.sequence) if identity.sequence >= 0 else None
     )
     time_delta = abs(
         (nearest.identity.capture_datetime - identity.capture_datetime).total_seconds()
     )
     coherent = _coherent_same_day(candidates, nearest)
 
-    if (
-        seq_delta is not None
-        and seq_delta <= HIGH_SEQ_DELTA
-        and time_delta <= HIGH_TIME_DELTA_S
-    ):
+    if seq_delta is not None and seq_delta <= HIGH_SEQ_DELTA and time_delta <= HIGH_TIME_DELTA_S:
         confidence = "high"
         review_required = False
         reason = f"adjacent_sequence_short_time|seq_delta={seq_delta}|time_delta_s={time_delta:.1f}"
@@ -366,8 +429,7 @@ def infer_jpg_exif_same_shoot(
         confidence = "medium"
         review_required = True
         reason = (
-            f"near_sequence_same_day_coherent|seq_delta={seq_delta}"
-            f"|time_delta_s={time_delta:.1f}"
+            f"near_sequence_same_day_coherent|seq_delta={seq_delta}|time_delta_s={time_delta:.1f}"
         )
     elif time_delta <= LOW_TIME_DELTA_S and coherent:
         confidence = "low"
@@ -406,18 +468,14 @@ def _bracketing_pair(
         photo
         for photo in photos
         if photo.identity.sequence < identity.sequence
-        and abs(
-            (photo.identity.capture_datetime - identity.capture_datetime).total_seconds()
-        )
+        and abs((photo.identity.capture_datetime - identity.capture_datetime).total_seconds())
         <= MEDIUM_TIME_DELTA_S
     ]
     after = [
         photo
         for photo in photos
         if photo.identity.sequence > identity.sequence
-        and abs(
-            (photo.identity.capture_datetime - identity.capture_datetime).total_seconds()
-        )
+        and abs((photo.identity.capture_datetime - identity.capture_datetime).total_seconds())
         <= MEDIUM_TIME_DELTA_S
     ]
     if not before or not after:
@@ -453,12 +511,8 @@ def _evidence_link(
     *,
     role: str,
 ) -> JpgEvidenceLink:
-    seq_delta = (
-        photo.identity.sequence - source.sequence if source.sequence >= 0 else None
-    )
-    time_delta = (
-        photo.identity.capture_datetime - source.capture_datetime
-    ).total_seconds()
+    seq_delta = photo.identity.sequence - source.sequence if source.sequence >= 0 else None
+    time_delta = (photo.identity.capture_datetime - source.capture_datetime).total_seconds()
     return JpgEvidenceLink(
         path=str(photo.path),
         latitude=photo.latitude,
@@ -470,6 +524,7 @@ def _evidence_link(
         sequence_delta=seq_delta,
         time_delta_seconds=time_delta,
         role=role,
+        duplicate_paths=[str(path) for path in photo.alternate_paths],
     )
 
 
@@ -557,18 +612,14 @@ def enumerate_nearby_jpg_evidence(
 
     gps_ranked.sort(
         key=lambda item: (
-            abs(item["sequence_delta"])
-            if item["sequence_delta"] is not None
-            else 10_000,
+            abs(item["sequence_delta"]) if item["sequence_delta"] is not None else 10_000,
             abs(float(item["time_delta_seconds"])),
             item["path"],
         )
     )
     non_gps.sort(
         key=lambda item: (
-            abs(item["sequence_delta"])
-            if item["sequence_delta"] is not None
-            else 10_000,
+            abs(item["sequence_delta"]) if item["sequence_delta"] is not None else 10_000,
             abs(float(item["time_delta_seconds"])),
             item["path"],
         )
@@ -635,11 +686,7 @@ def find_dji_sequence_neighbors(
                 "kind": (
                     "still"
                     if suffix in JPG_EXTENSIONS
-                    else (
-                        "video"
-                        if suffix in {".mp4", ".mov", ".mts", ".m4v"}
-                        else "other"
-                    )
+                    else ("video" if suffix in {".mp4", ".mov", ".mts", ".m4v"} else "other")
                 ),
                 "capture_datetime": other.capture_datetime.isoformat(sep=" "),
             }
@@ -769,9 +816,7 @@ def _parse_exif_tiff(
     return lat, lon, alt, model, exif_dt
 
 
-def _read_ifd_entries(
-    tiff: bytes, offset: int, endian_fmt: str
-) -> dict[int, bytes]:
+def _read_ifd_entries(tiff: bytes, offset: int, endian_fmt: str) -> dict[int, bytes]:
     if offset < 0 or offset + 2 > len(tiff):
         return {}
     try:
@@ -801,9 +846,7 @@ def _exif_long(entry: bytes | None, endian_fmt: str) -> int | None:
     return struct.unpack(endian_fmt + "I", value)[0]
 
 
-def _exif_string(
-    tiff: bytes, entry: bytes | None, endian_fmt: str
-) -> str | None:
+def _exif_string(tiff: bytes, entry: bytes | None, endian_fmt: str) -> str | None:
     if entry is None or len(entry) < 12:
         return None
     typ, count = struct.unpack(endian_fmt + "HH", entry[2:6])
