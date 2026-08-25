@@ -277,8 +277,8 @@ def _add_recover_locations_parser(subparsers: argparse._SubParsersAction) -> Non
     parser = subparsers.add_parser(
         "recover-locations",
         help=(
-            "Recover Unknown Location sessions from SRT GPS consensus and "
-            "optionally rewrite review XML names from SQLite."
+            "Recover Unknown Location sessions from SRT GPS, same-shoot DJI "
+            "JPG EXIF inference, and optionally rewrite review XML names."
         ),
     )
     parser.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
@@ -288,6 +288,10 @@ def _add_recover_locations_parser(subparsers: argparse._SubParsersAction) -> Non
             "Limit recovery to one Stockify run. "
             "Default with --db is catalog-wide across all complete runs."
         ),
+    )
+    parser.add_argument(
+        "--session-id",
+        help="Limit recovery to one shoot session id.",
     )
     parser.add_argument("--report", type=Path, help="Optional JSON report path.")
     parser.add_argument(
@@ -318,9 +322,14 @@ def _add_recover_locations_parser(subparsers: argparse._SubParsersAction) -> Non
         action="append",
         default=[],
         help=(
-            "Root to scan for SRT sidecars when catalog paths are missing. "
-            "Repeatable. Defaults to /Volumes."
+            "Root to scan for SRT sidecars and same-shoot DJI JPG/JPEG stills "
+            "when catalog paths are missing. Repeatable. Defaults to /Volumes."
         ),
+    )
+    parser.add_argument(
+        "--no-jpg-exif-recovery",
+        action="store_true",
+        help="Disable same-shoot JPG EXIF GPS fallback (SRT/catalog GPS only).",
     )
     parser.add_argument(
         "--places-file",
@@ -363,8 +372,8 @@ def _add_diagnose_locations_parser(subparsers: argparse._SubParsersAction) -> No
         action="append",
         default=[],
         help=(
-            "Root to scan for currently available media/SRT files. "
-            "Repeatable. Defaults to /Volumes."
+            "Root to scan for currently available media/SRT files and same-shoot "
+            "DJI JPG/JPEG stills. Repeatable. Defaults to /Volumes."
         ),
     )
     parser.add_argument(
@@ -464,19 +473,13 @@ def _run_stockify(args: argparse.Namespace) -> int:
         if args.manifest
         else output.with_name(f"{output.stem}-export-manifest.json")
     )
-    db_path = (
-        args.db.expanduser().resolve()
-        if args.db
-        else output.parent / "vclip.sqlite3"
-    )
+    db_path = args.db.expanduser().resolve() if args.db else output.parent / "vclip.sqlite3"
     if output == input_path:
         raise VClipError("The output XML must not overwrite the source XML.")
 
     _, repository = _database(db_path)
     places_path = (
-        args.places_file.expanduser().resolve()
-        if args.places_file
-        else default_places_path()
+        args.places_file.expanduser().resolve() if args.places_file else default_places_path()
     )
     location_resolver = build_location_resolver(
         repository,
@@ -622,9 +625,7 @@ def _run_package(args: argparse.Namespace) -> int:
 def _run_recover_locations(args: argparse.Namespace) -> int:
     _, repository = _database(args.db.expanduser().resolve())
     places_path = (
-        args.places_file.expanduser().resolve()
-        if args.places_file
-        else default_places_path()
+        args.places_file.expanduser().resolve() if args.places_file else default_places_path()
     )
     location_resolver = build_location_resolver(
         repository,
@@ -634,9 +635,7 @@ def _run_recover_locations(args: argparse.Namespace) -> int:
     )
     report_path = args.report.expanduser().resolve() if args.report else None
     scan_roots = (
-        [path.expanduser().resolve() for path in args.scan]
-        if args.scan
-        else [Path("/Volumes")]
+        [path.expanduser().resolve() for path in args.scan] if args.scan else [Path("/Volumes")]
     )
     service = LocationRecoveryService(
         repository,
@@ -651,6 +650,8 @@ def _run_recover_locations(args: argparse.Namespace) -> int:
         rewrite_review_xml=args.rewrite_review_xml,
         report_path=report_path,
         refresh_resolved=args.refresh_resolved,
+        enable_jpg_exif=not args.no_jpg_exif_recovery,
+        session_id=args.session_id,
     )
     print()
     print("Location recovery")
@@ -659,6 +660,8 @@ def _run_recover_locations(args: argparse.Namespace) -> int:
         print(line)
     if args.run_id:
         print(f"Run ID filter:             {args.run_id}")
+    if args.session_id:
+        print(f"Session ID filter:         {args.session_id}")
     if result.rewritten_review_xmls:
         for path in result.rewritten_review_xmls:
             print(f"Review XML rewritten:      {path}")
@@ -672,14 +675,10 @@ def _run_recover_locations(args: argparse.Namespace) -> int:
 def _run_diagnose_locations(args: argparse.Namespace) -> int:
     _, repository = _database(args.db.expanduser().resolve())
     scan_roots = (
-        [path.expanduser().resolve() for path in args.scan]
-        if args.scan
-        else [Path("/Volumes")]
+        [path.expanduser().resolve() for path in args.scan] if args.scan else [Path("/Volumes")]
     )
     places_path = (
-        args.places_file.expanduser().resolve()
-        if args.places_file
-        else default_places_path()
+        args.places_file.expanduser().resolve() if args.places_file else default_places_path()
     )
     location_resolver = build_location_resolver(
         repository,

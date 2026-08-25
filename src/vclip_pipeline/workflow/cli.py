@@ -13,6 +13,11 @@ from ..db import CatalogRepository, Database
 from ..errors import VClipError
 from ..publishing import ContentReadinessService, PackageReleaseService, ReviewService
 from .catalog import WorkflowCatalog
+from .catalog_inventory import (
+    GROUP_BY_CHOICES,
+    ORIENTATION_CHOICES,
+    format_location_inventory_text,
+)
 from .catalog_quality import (
     CatalogQualityService,
     format_quality_report,
@@ -39,9 +44,17 @@ from .review_location_materialize import (
     ReviewLocationMaterializeService,
     format_materialize_plan_text,
 )
+from .review_location_propagate import (
+    HistoricalLocationPropagateService,
+    format_propagate_report_text,
+)
 from .review_location_recover import (
     ReviewLocationRecoverService,
     format_location_recover_text,
+)
+from .review_location_restore import (
+    HistoricalLocationRestoreService,
+    format_restore_report_text,
 )
 from .review_prune import ReviewPruneService, format_prune_text_report
 from .review_shard import ReviewShardService
@@ -400,6 +413,115 @@ def build_parser() -> argparse.ArgumentParser:
     materialize.add_argument("--quiet", action="store_true")
     materialize.set_defaults(handler=_run_review_location_materialize)
 
+    restore_loc = sub.add_parser(
+        "review-location-restore",
+        help=(
+            "Validate historical review-location materialization against the "
+            "catalog (default, read-only) or persist safe_to_restore rows "
+            "with --write. Does not remount media or rewrite FCPXML."
+        ),
+    )
+    restore_loc.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    restore_loc.add_argument(
+        "--plan",
+        type=Path,
+        required=True,
+        help="Historical location-materialization-plan.json recovery journal.",
+    )
+    restore_loc.add_argument(
+        "--forensic-json",
+        type=Path,
+        required=True,
+        help="Historical jpg-exif-forensic.json used to join source evidence.",
+    )
+    restore_loc.add_argument(
+        "--review-root",
+        type=Path,
+        help="Optional final FCPXML corpus for a read-only name/identity audit.",
+    )
+    restore_loc.add_argument("--report", type=Path, help="Write restore-validation JSON here.")
+    restore_loc.add_argument("--text-report", type=Path)
+    restore_loc.add_argument(
+        "--write",
+        action="store_true",
+        help=(
+            "Persist safe_to_restore catalog rows in one transaction after a "
+            "timestamped SQLite backup. Default is validation/dry-run."
+        ),
+    )
+    restore_loc.add_argument(
+        "--backup-path",
+        type=Path,
+        help="Explicit backup destination for --write. Never overwrites.",
+    )
+    restore_loc.add_argument("--quiet", action="store_true")
+    restore_loc.set_defaults(handler=_run_review_location_restore)
+
+    propagate_loc = sub.add_parser(
+        "review-location-propagate",
+        help=(
+            "Validate historical location copies (default, read-only) or persist "
+            "safe_to_restore rows with --write. Phase 1 copies older-DB/corpus "
+            "locations. Phase 2 copies safe source-identity donor locations. "
+            "Does not remount media, rerun inference, or rewrite FCPXML."
+        ),
+    )
+    propagate_loc.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    propagate_loc.add_argument(
+        "--phase",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="1 = older-DB/corpus (default). 2 = safe source-identity inherit.",
+    )
+    propagate_loc.add_argument(
+        "--reconciliation",
+        type=Path,
+        help=(
+            "current-unresolved-location-reconciliation.json. Required for "
+            "Phase 1."
+        ),
+    )
+    propagate_loc.add_argument(
+        "--report",
+        type=Path,
+        help="Write validation JSON here.",
+    )
+    propagate_loc.add_argument("--text-report", type=Path)
+    propagate_loc.add_argument(
+        "--source-identity-safety",
+        type=Path,
+        help=(
+            "Phase 2 input: source-identity-propagation-safety.json. Only "
+            "safe_to_inherit rows are considered."
+        ),
+    )
+    propagate_loc.add_argument(
+        "--source-identity-report",
+        type=Path,
+        help=(
+            "Write the source-identity safety JSON here. Phase 1 reports all "
+            "165 cases; Phase 2 reports excluded/live-safe counts."
+        ),
+    )
+    propagate_loc.add_argument(
+        "--write",
+        action="store_true",
+        help=(
+            "Persist safe_to_restore catalog rows in one transaction after a "
+            "timestamped SQLite backup. Default is validation/dry-run. "
+            "Never writes FCPXML. Phase 2 never writes ambiguous rows and "
+            "does not flatten session summaries."
+        ),
+    )
+    propagate_loc.add_argument(
+        "--backup-path",
+        type=Path,
+        help="Explicit backup destination for --write. Never overwrites.",
+    )
+    propagate_loc.add_argument("--quiet", action="store_true")
+    propagate_loc.set_defaults(handler=_run_review_location_propagate)
+
     ingest = sub.add_parser(
         "exports-ingest",
         help="Match and persist final exports without creating packages.",
@@ -456,6 +578,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     search.add_argument("--json", action="store_true")
     search.set_defaults(handler=_run_catalog_search)
+    locations = catalog_sub.add_parser(
+        "locations",
+        help="Read-only geographic inventory of exported stock clips.",
+    )
+    locations.add_argument("--db", type=Path, default=Path("vclip.sqlite3"))
+    locations.add_argument(
+        "--group-by",
+        choices=GROUP_BY_CHOICES,
+        default="city",
+        help="Grouping key. Default: city.",
+    )
+    locations.add_argument("--city", help="Filter to a resolved city name.")
+    locations.add_argument(
+        "--neighborhood",
+        help="Filter to a resolved neighborhood name.",
+    )
+    locations.add_argument(
+        "--market",
+        help="Filter to clips assigned to this market id or label.",
+    )
+    locations.add_argument(
+        "--orientation",
+        choices=ORIENTATION_CHOICES,
+        help="Filter to vertical or horizontal (landscape) exports.",
+    )
+    locations.add_argument("--json", action="store_true")
+    locations.set_defaults(handler=_run_catalog_locations)
     audit = catalog_sub.add_parser(
         "audit",
         help="Audit visual-enrichment quality for a run/cohort (no OpenAI calls).",
@@ -898,6 +1047,136 @@ def _run_review_location_materialize(args: argparse.Namespace) -> int:
     return 1 if report.shards_failed else 0
 
 
+def _run_review_location_restore(args: argparse.Namespace) -> int:
+    db_path = args.db.expanduser().resolve()
+    write = bool(args.write)
+    if write:
+        repository, workflow = _catalog(args.db)
+    else:
+        database = Database(db_path)
+        repository = CatalogRepository(database)
+        workflow = WorkflowCatalog(database)
+    service = HistoricalLocationRestoreService(
+        repository,
+        workflow,
+        progress=_progress(args.quiet),
+    )
+    plan_path = args.plan.expanduser().resolve()
+    forensic_json = args.forensic_json.expanduser().resolve()
+    review_root = (
+        args.review_root.expanduser().resolve() if args.review_root else None
+    )
+    if write:
+        if args.backup_path:
+            print(f"Requested backup path: {args.backup_path.expanduser().resolve()}")
+        report = service.restore(
+            plan_path=plan_path,
+            forensic_json=forensic_json,
+            review_root=review_root,
+            write=True,
+            backup_path=(
+                args.backup_path.expanduser().resolve() if args.backup_path else None
+            ),
+        )
+        print(f"Backup: {report.backup_path}")
+    else:
+        report = service.validate(
+            plan_path=plan_path,
+            forensic_json=forensic_json,
+            review_root=review_root,
+        )
+    text = format_restore_report_text(report)
+    print()
+    print(text.rstrip())
+    if args.report:
+        report_path = args.report.expanduser().resolve()
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            json.dumps(report.as_dict(), indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        print(f"JSON report: {report_path}")
+    if args.text_report:
+        text_path = args.text_report.expanduser().resolve()
+        text_path.parent.mkdir(parents=True, exist_ok=True)
+        text_path.write_text(text, encoding="utf-8")
+        print(f"Text report: {text_path}")
+    return 0
+
+
+def _run_review_location_propagate(args: argparse.Namespace) -> int:
+    db_path = args.db.expanduser().resolve()
+    write = bool(args.write)
+    if write:
+        repository, workflow = _catalog(args.db)
+    else:
+        database = Database(db_path)
+        repository = CatalogRepository(database)
+        workflow = None
+    service = HistoricalLocationPropagateService(
+        repository,
+        workflow,
+        progress=_progress(args.quiet),
+    )
+    phase = int(args.phase)
+    reconciliation_path = (
+        args.reconciliation.expanduser().resolve() if args.reconciliation else None
+    )
+    source_identity_path = (
+        args.source_identity_safety.expanduser().resolve()
+        if args.source_identity_safety
+        else None
+    )
+    if phase == 1 and reconciliation_path is None:
+        raise VClipError("Phase 1 requires --reconciliation")
+    if phase == 2 and source_identity_path is None:
+        raise VClipError("Phase 2 requires --source-identity-safety")
+    if write:
+        if args.backup_path:
+            print(f"Requested backup path: {args.backup_path.expanduser().resolve()}")
+        report = service.propagate(
+            phase=phase,
+            reconciliation_path=reconciliation_path,
+            source_identity_path=source_identity_path,
+            write=True,
+            backup_path=(
+                args.backup_path.expanduser().resolve() if args.backup_path else None
+            ),
+        )
+        print(f"Backup: {report.backup_path}")
+    else:
+        report = service.validate(
+            phase=phase,
+            reconciliation_path=reconciliation_path,
+            source_identity_path=source_identity_path,
+        )
+    text = format_propagate_report_text(report)
+    print()
+    print(text.rstrip())
+    if args.report:
+        report_path = args.report.expanduser().resolve()
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            json.dumps(report.as_dict(), indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        print(f"JSON report: {report_path}")
+    if args.text_report:
+        text_path = args.text_report.expanduser().resolve()
+        text_path.parent.mkdir(parents=True, exist_ok=True)
+        text_path.write_text(text, encoding="utf-8")
+        print(f"Text report: {text_path}")
+    if args.source_identity_report:
+        identity_path = args.source_identity_report.expanduser().resolve()
+        identity_path.parent.mkdir(parents=True, exist_ok=True)
+        identity_path.write_text(
+            json.dumps(report.source_identity, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        print(f"Source-identity report: {identity_path}")
+    return 0
+
+
 def _run_review_location_recover(args: argparse.Namespace) -> int:
     from ..geo import build_location_resolver, default_places_path
 
@@ -1068,6 +1347,22 @@ def _run_canonicalize_entities(args: argparse.Namespace) -> int:
     print(f"Subjects unresolved:{result['subjects_unresolved']}")
     if args.dry_run:
         print("Dry run:            no database writes")
+    return 0
+
+
+def _run_catalog_locations(args: argparse.Namespace) -> int:
+    _, workflow = _catalog(args.db)
+    report = workflow.location_inventory(
+        group_by=args.group_by,
+        city=args.city,
+        neighborhood=args.neighborhood,
+        market=args.market,
+        orientation=args.orientation,
+    )
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0
+    print(format_location_inventory_text(report))
     return 0
 
 
