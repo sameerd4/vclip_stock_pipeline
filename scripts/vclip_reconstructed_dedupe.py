@@ -93,11 +93,14 @@ class Removal:
 
 
 def source_role(event_name: str, metadata: dict[str, str]) -> str | None:
-    variant = metadata.get("com.vclip.telemetry.variant", "").casefold()
+    # Product role is defined by the physical reconstruction event bucket.
+    # Internal telemetry variants describe how a candidate was generated and
+    # must not promote QC Review inventory into the customer-facing pool.
+    _ = metadata
     event = event_name.casefold()
-    if variant == "ready_cut" or "ready cuts" in event:
+    if "ready cuts" in event:
         return "ready_cut"
-    if variant == "extended_master" or "extended masters" in event:
+    if "extended masters" in event:
         return "extended_master"
     return None
 
