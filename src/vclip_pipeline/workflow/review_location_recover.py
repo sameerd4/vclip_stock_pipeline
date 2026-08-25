@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
@@ -1300,44 +1301,9 @@ class ReviewLocationRecoverService:
     def _persist_candidate_updates(self, recoveries: list[LocationRecoveryRow]) -> None:
         now = utc_now()
         with self.repository.database.transaction() as connection:
-            for item in recoveries:
-                location = (item.provenance or {}).get("location") or {}
-                new_label = (item.provenance or {}).get("generated_project_label")
-                connection.execute(
-                    """
-                    UPDATE stock_candidates
-                    SET location_json=?,
-                        generated_event_name=?,
-                        generated_project_label=COALESCE(?, generated_project_label),
-                        generated_clip_project_name=?,
-                        expected_export_basename=?,
-                        updated_at=?
-                    WHERE run_id=? AND stock_clip_id=?
-                    """,
-                    (
-                        json_dumps(location),
-                        item.new_event_name,
-                        new_label,
-                        item.new_project_name,
-                        item.new_project_name,
-                        now,
-                        item.stockify_run_id,
-                        item.stock_clip_id,
-                    ),
-                )
-                connection.execute(
-                    """
-                    UPDATE generated_occurrences
-                    SET generated_event_name=?, generated_project_name=?
-                    WHERE run_id=? AND stock_clip_id=? AND representation='individual'
-                    """,
-                    (
-                        item.new_event_name,
-                        item.new_project_name,
-                        item.stockify_run_id,
-                        item.stock_clip_id,
-                    ),
-                )
+            persist_review_location_candidate_updates(
+                connection, recoveries, now=now
+            )
 
     def _hypothetical_audit(
         self,
@@ -1497,6 +1463,61 @@ def _is_unknown_candidate(row: dict[str, Any], event_name: str | None) -> bool:
     if label and label.casefold() not in _UNKNOWN_LABELS:
         return False
     return True
+
+
+def persist_review_location_candidate_updates(
+    connection: sqlite3.Connection,
+    recoveries: Iterable[LocationRecoveryRow],
+    *,
+    now: str | None = None,
+) -> int:
+    """Apply historical materializer candidate/occurrence name+location writes.
+
+    Caller owns the transaction. Used by review-location-recover persist and by
+    historical location restore so both share one SQL implementation.
+    """
+    stamp = now or utc_now()
+    count = 0
+    for item in recoveries:
+        location = (item.provenance or {}).get("location") or {}
+        new_label = (item.provenance or {}).get("generated_project_label")
+        connection.execute(
+            """
+            UPDATE stock_candidates
+            SET location_json=?,
+                generated_event_name=?,
+                generated_project_label=COALESCE(?, generated_project_label),
+                generated_clip_project_name=?,
+                expected_export_basename=?,
+                updated_at=?
+            WHERE run_id=? AND stock_clip_id=?
+            """,
+            (
+                json_dumps(location),
+                item.new_event_name,
+                new_label,
+                item.new_project_name,
+                item.new_project_name,
+                stamp,
+                item.stockify_run_id,
+                item.stock_clip_id,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE generated_occurrences
+            SET generated_event_name=?, generated_project_name=?
+            WHERE run_id=? AND stock_clip_id=? AND representation='individual'
+            """,
+            (
+                item.new_event_name,
+                item.new_project_name,
+                item.stockify_run_id,
+                item.stock_clip_id,
+            ),
+        )
+        count += 1
+    return count
 
 
 def _event_capture_date(
