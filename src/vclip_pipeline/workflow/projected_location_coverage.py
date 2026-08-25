@@ -18,6 +18,7 @@ from .camera_scope import (
 )
 from .editorial_group_forensics import (
     _implied_place_from_event_name,
+    country_for_admin_area,
 )
 from .review_location_recover import (
     ReviewLocationRecoverService,
@@ -285,12 +286,26 @@ def _build_overlay(
         )
         if not approved:
             continue
+        label = str(group.get("recommended_group_label") or "")
+        states = {
+            str(item.get("state") or "")
+            for item in group.get("source_evidence") or []
+            if item.get("state")
+        }
+        group_country = country_for_admin_area(
+            next(iter(states)) if len(states) == 1 else None,
+            countries=[
+                item.get("country")
+                for item in group.get("source_evidence") or []
+            ],
+        )
         for clip_id in group.get("unknown_clips_eligible_to_inherit") or []:
             approved_consensus[str(clip_id)] = {
-                "label": group.get("recommended_group_label"),
+                "label": label,
                 "level": group.get("recommended_label_level"),
                 "confidence": group.get("confidence"),
                 "event_name": event_name,
+                "country": group_country,
                 "evidence_source": "editorial_group_consensus",
             }
 
@@ -559,11 +574,21 @@ def _projected_place(
     if consensus:
         label = str(consensus.get("label") or "")
         implied = _implied_place_from_event_name(label)
+        parsed = _parse_existing_event_label(label)
+        state = (
+            _title(implied[1])
+            if implied and implied[1]
+            else parsed.get("state")
+        )
         return {
             "city": _title(implied[0]) if implied and implied[0] else label,
             "neighborhood": label if consensus.get("level") == "neighborhood" else None,
-            "state": _title(implied[1]) if implied and implied[1] else None,
-            "country": "United States",
+            "state": state,
+            "country": country_for_admin_area(
+                state,
+                explicit_country=str(consensus.get("country") or parsed.get("country") or "")
+                or None,
+            ),
             "public_label": label,
             "source": "editorial_group_consensus",
         }

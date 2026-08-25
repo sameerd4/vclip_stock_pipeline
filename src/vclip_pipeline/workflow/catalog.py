@@ -901,6 +901,7 @@ class WorkflowCatalog:
                 e.exported_filename,
                 e.exported_path,
                 e.sha256 AS export_sha256,
+                e.file_size_bytes,
                 e.duration_seconds AS export_duration_seconds,
                 m.width,
                 m.height,
@@ -1142,6 +1143,32 @@ class WorkflowCatalog:
             query,
             limit=limit,
             explain=explain,
+        )
+
+    def location_inventory(
+        self,
+        *,
+        group_by: str = "city",
+        city: str | None = None,
+        neighborhood: str | None = None,
+        market: str | None = None,
+        orientation: str | None = None,
+    ) -> dict[str, Any]:
+        """Read-only geographic inventory of canonical exported stock clips.
+
+        Uses the same accepted/matched/approved export rows as catalog search.
+        Does not scan the filesystem, mutate the database, or reindex.
+        """
+        from .catalog_inventory import aggregate_location_inventory, load_clip_markets
+
+        return aggregate_location_inventory(
+            self.eligible_exports(),
+            markets_by_clip=load_clip_markets(self.database),
+            group_by=group_by,
+            city=city,
+            neighborhood=neighborhood,
+            market=market,
+            orientation=orientation,
         )
 
     def save_collection_definition(
@@ -1532,70 +1559,88 @@ class WorkflowCatalog:
         self,
         *,
         recoveries: Iterable[Any],
+        connection: sqlite3.Connection | None = None,
     ) -> int:
-        """Persist review-shard location recovery provenance (idempotent upsert)."""
+        """Persist review-shard location recovery provenance (idempotent upsert).
+
+        When ``connection`` is provided, the caller owns the transaction.
+        """
         now = utc_now()
+        items = list(recoveries)
+        if connection is not None:
+            return self._upsert_review_location_recoveries(
+                connection, items, now=now
+            )
+        with self.database.transaction() as owned:
+            return self._upsert_review_location_recoveries(owned, items, now=now)
+
+    def _upsert_review_location_recoveries(
+        self,
+        connection: sqlite3.Connection,
+        recoveries: list[Any],
+        *,
+        now: str,
+    ) -> int:
         count = 0
-        with self.database.transaction() as connection:
-            for item in recoveries:
-                recovery_id = stable_id(
-                    "LRECV",
+        for item in recoveries:
+            recovery_id = stable_id(
+                "LRECV",
+                getattr(item, "stockify_run_id"),
+                getattr(item, "stock_clip_id"),
+            )
+            provenance = getattr(item, "provenance", None) or {}
+            srt_paths = getattr(item, "srt_paths", None) or []
+            connection.execute(
+                """
+                INSERT INTO review_location_recoveries(
+                    id, stockify_run_id, stock_clip_id,
+                    original_event_name, new_event_name,
+                    original_project_name, new_project_name,
+                    source_media, srt_paths_json,
+                    representative_lat, representative_lon,
+                    resolution_confidence, recovery_reason,
+                    source_shard, input_xml, output_xml,
+                    provenance_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(stockify_run_id, stock_clip_id) DO UPDATE SET
+                    original_event_name=excluded.original_event_name,
+                    new_event_name=excluded.new_event_name,
+                    original_project_name=excluded.original_project_name,
+                    new_project_name=excluded.new_project_name,
+                    source_media=excluded.source_media,
+                    srt_paths_json=excluded.srt_paths_json,
+                    representative_lat=excluded.representative_lat,
+                    representative_lon=excluded.representative_lon,
+                    resolution_confidence=excluded.resolution_confidence,
+                    recovery_reason=excluded.recovery_reason,
+                    source_shard=excluded.source_shard,
+                    input_xml=excluded.input_xml,
+                    output_xml=excluded.output_xml,
+                    provenance_json=excluded.provenance_json,
+                    created_at=excluded.created_at
+                """,
+                (
+                    recovery_id,
                     getattr(item, "stockify_run_id"),
                     getattr(item, "stock_clip_id"),
-                )
-                provenance = getattr(item, "provenance", None) or {}
-                srt_paths = getattr(item, "srt_paths", None) or []
-                connection.execute(
-                    """
-                    INSERT INTO review_location_recoveries(
-                        id, stockify_run_id, stock_clip_id,
-                        original_event_name, new_event_name,
-                        original_project_name, new_project_name,
-                        source_media, srt_paths_json,
-                        representative_lat, representative_lon,
-                        resolution_confidence, recovery_reason,
-                        source_shard, input_xml, output_xml,
-                        provenance_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(stockify_run_id, stock_clip_id) DO UPDATE SET
-                        original_event_name=excluded.original_event_name,
-                        new_event_name=excluded.new_event_name,
-                        original_project_name=excluded.original_project_name,
-                        new_project_name=excluded.new_project_name,
-                        source_media=excluded.source_media,
-                        srt_paths_json=excluded.srt_paths_json,
-                        representative_lat=excluded.representative_lat,
-                        representative_lon=excluded.representative_lon,
-                        resolution_confidence=excluded.resolution_confidence,
-                        recovery_reason=excluded.recovery_reason,
-                        source_shard=excluded.source_shard,
-                        input_xml=excluded.input_xml,
-                        output_xml=excluded.output_xml,
-                        provenance_json=excluded.provenance_json,
-                        created_at=excluded.created_at
-                    """,
-                    (
-                        recovery_id,
-                        getattr(item, "stockify_run_id"),
-                        getattr(item, "stock_clip_id"),
-                        getattr(item, "original_event_name", None),
-                        getattr(item, "new_event_name", None),
-                        getattr(item, "original_project_name", None),
-                        getattr(item, "new_project_name", None),
-                        getattr(item, "source_media", None),
-                        json_dumps(list(srt_paths)),
-                        getattr(item, "representative_lat", None),
-                        getattr(item, "representative_lon", None),
-                        getattr(item, "resolution_confidence"),
-                        getattr(item, "recovery_reason"),
-                        getattr(item, "source_shard", None),
-                        getattr(item, "input_xml", None),
-                        getattr(item, "output_xml", None),
-                        json_dumps(provenance),
-                        now,
-                    ),
-                )
-                count += 1
+                    getattr(item, "original_event_name", None),
+                    getattr(item, "new_event_name", None),
+                    getattr(item, "original_project_name", None),
+                    getattr(item, "new_project_name", None),
+                    getattr(item, "source_media", None),
+                    json_dumps(list(srt_paths)),
+                    getattr(item, "representative_lat", None),
+                    getattr(item, "representative_lon", None),
+                    getattr(item, "resolution_confidence"),
+                    getattr(item, "recovery_reason"),
+                    getattr(item, "source_shard", None),
+                    getattr(item, "input_xml", None),
+                    getattr(item, "output_xml", None),
+                    json_dumps(provenance),
+                    now,
+                ),
+            )
+            count += 1
         return count
 
     def review_location_recovered_ids(self, stockify_run_id: str) -> set[str]:
