@@ -135,7 +135,7 @@ def main() -> int:
     overall = counts_ok and ready_ok and master_ok
     print("DECISION PARITY:", "PASS" if overall else "FAIL")
     if overall:
-        print("LRF proxy changed the compute path without changing product decisions.")
+        print("Alternate visual compute path changed implementation without changing product decisions.")
     else:
         print("Do not launch the full corpus yet; inspect the listed decision differences.")
     return 0 if overall else 2
