@@ -55,6 +55,7 @@ class TrajectorySample:
     sample_count: int = 1
     source: str = "srt"
     filename: str | None = None
+    provenance: dict[str, Any] | None = None
 
 
 @dataclass
@@ -112,11 +113,7 @@ class TrajectoryLocationResult:
             "center_lat": self.center_lat,
             "center_lon": self.center_lon,
             "resolved_neighborhoods": sorted(
-                {
-                    item.neighborhood
-                    for item in self.place_support
-                    if item.neighborhood
-                }
+                {item.neighborhood for item in self.place_support if item.neighborhood}
             ),
             "resolved_cities": sorted(
                 {
@@ -160,11 +157,7 @@ def resolve_flight_trajectory(
     cluster_separation_meters: float = GEO_CLUSTER_SEPARATION_METERS,
 ) -> TrajectoryLocationResult:
     """Resolve a flight's GPS trajectory to the most specific coherent place."""
-    usable = [
-        sample
-        for sample in samples
-        if is_usable_gps(sample.latitude, sample.longitude)
-    ]
+    usable = [sample for sample in samples if is_usable_gps(sample.latitude, sample.longitude)]
     if not usable:
         return TrajectoryLocationResult(
             status="unresolved",
@@ -276,9 +269,7 @@ def resolve_flight_trajectory(
     # Prefer a row that already uses the parent city spelling (Charlottesville
     # over University of Virginia) when nested labels were collapsed.
     parent_members = [
-        item
-        for item in members
-        if _city_key(item.city, item.state) == municipality_key
+        item for item in members if _city_key(item.city, item.state) == municipality_key
     ]
     primary = max(
         parent_members or members,
@@ -292,11 +283,7 @@ def resolve_flight_trajectory(
         parent = nested_municipality_parent(primary.city, primary.state)
         if parent is not None:
             display_city, display_state = parent
-    neighborhoods = {
-        item.neighborhood.casefold()
-        for item in members
-        if item.neighborhood
-    }
+    neighborhoods = {item.neighborhood.casefold() for item in members if item.neighborhood}
     place_type = str(primary.place.get("place_type") or "city")
     if consensus_method == "compatible_nested":
         place_type = "city"
@@ -359,9 +346,7 @@ def cluster_source_points(
     if not source_points:
         return []
     labels = place_labels_by_source or {}
-    clusters: list[list[tuple[str, float, float]]] = [
-        [point] for point in source_points
-    ]
+    clusters: list[list[tuple[str, float, float]]] = [[point] for point in source_points]
     merged = True
     while merged and len(clusters) > 1:
         merged = False
@@ -394,9 +379,7 @@ def cluster_source_points(
                 center_lat=_median(lats),
                 center_lon=_median(lons),
                 source_count=len(members),
-                place_labels=sorted(
-                    {labels[key] for key in keys if key in labels}
-                ),
+                place_labels=sorted({labels[key] for key in keys if key in labels}),
             )
         )
     return results
@@ -408,9 +391,7 @@ def format_trajectory_diagnostics(
     """Human-readable place-support block for diagnostics/recovery reports."""
     if isinstance(result, TrajectoryLocationResult):
         payload = result.diagnostics()
-        support = [
-            (item.label, item.source_count) for item in result.place_support
-        ]
+        support = [(item.label, item.source_count) for item in result.place_support]
         coherence = result.coherence
         assigned = (result.location or {}).get("public_label")
     else:
@@ -522,11 +503,7 @@ def _select_municipality(
     if len(votes) == 1:
         method = "unanimous"
         # Distinguish pure nested collapse from a single raw label.
-        raw_keys = {
-            _city_key(item.city, item.state)
-            for item in place_support
-            if item.city
-        }
+        raw_keys = {_city_key(item.city, item.state) for item in place_support if item.city}
         if len(raw_keys) > 1:
             method = "compatible_nested"
         return best_key, method
@@ -552,11 +529,7 @@ def _complete_linkage_distance(
     left: list[tuple[str, float, float]],
     right: list[tuple[str, float, float]],
 ) -> float:
-    return max(
-        haversine_meters(a[1], a[2], b[1], b[2])
-        for a in left
-        for b in right
-    )
+    return max(haversine_meters(a[1], a[2], b[1], b[2]) for a in left for b in right)
 
 
 def _location_from_place(
@@ -598,12 +571,9 @@ def _location_from_place(
             "flight_id": identity.flight_id if identity else None,
             "session_id": identity.session_id if identity else None,
             "coherence": coherence,
-            "source_file_count": len(
-                {key for item in place_support for key in item.source_keys}
-            ),
+            "source_file_count": len({key for item in place_support for key in item.source_keys}),
             "place_support": [
-                {"label": item.label, "source_count": item.source_count}
-                for item in place_support
+                {"label": item.label, "source_count": item.source_count} for item in place_support
             ],
         },
     }
