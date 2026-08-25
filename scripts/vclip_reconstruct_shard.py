@@ -289,7 +289,10 @@ def _is_grid_aligned(value: Fraction, grid: Fraction) -> bool:
 
 
 def edit_frame_boundary_errors(root: ET.Element) -> list[str]:
-    """Audit generated projects with the same frame-grid rule FCP enforces."""
+    # Audit only machine-generated project timing on exact edit-frame grids.
+    # Historical review projects are preserved byte-for-byte. Final Cut can
+    # import legacy projects whose durations are exact seconds even when those
+    # values are not integer multiples of NTSC rational frame durations.
     resources = first_direct_child(root, "resources")
     if resources is None:
         return ["missing <resources>"]
@@ -302,10 +305,12 @@ def edit_frame_boundary_errors(root: ET.Element) -> list[str]:
         for project in list(event):
             if local_name(project.tag) != "project":
                 continue
+
             project_name = project.get("name", "")
             sequence = first_direct_child(project, "sequence")
             if sequence is None:
                 continue
+
             fmt_res = index.get(sequence.get("format") or "")
             frame_raw = fmt_res.get("frameDuration") if fmt_res is not None else None
             if not frame_raw:
@@ -313,65 +318,93 @@ def edit_frame_boundary_errors(root: ET.Element) -> list[str]:
                 continue
             frame = parse_time(frame_raw)
 
-            sequence_duration = parse_time(sequence.get("duration"))
-            if not _is_grid_aligned(sequence_duration, frame):
-                errors.append(
-                    f"{project_name}: sequence duration {sequence.get('duration')} "
-                    f"is not aligned to {frame_raw}"
-                )
+            asset_clips = [
+                clip
+                for clip in sequence.iter()
+                if local_name(clip.tag) == "asset-clip"
+            ]
+            if not asset_clips:
+                continue
 
-            for clip in sequence.iter():
-                if local_name(clip.tag) != "asset-clip":
-                    continue
-                duration_raw = clip.get("duration")
-                if duration_raw and not _is_grid_aligned(parse_time(duration_raw), frame):
-                    errors.append(
-                        f"{project_name}: asset-clip duration {duration_raw} "
-                        f"is not aligned to sequence {frame_raw}"
-                    )
+            generated_clips: list[tuple[ET.Element, bool]] = []
+            project_has_generated_timing = False
 
-                # Only audit source-start frame alignment when this compiler
-                # actually generated a new source start. Historical review cuts
-                # are deliberately preserved byte-for-byte because they are known
-                # to import in Final Cut even when their source timing is expressed
-                # on a legacy/non-native rational timebase.
+            for clip in asset_clips:
                 metadata = read_vclip_metadata(clip)
                 variant = metadata.get("com.vclip.telemetry.variant")
                 current_id = metadata.get("com.vclip.stock_clip_id")
                 parent_ids = {
                     value.strip()
-                    for value in metadata.get("com.vclip.telemetry.parent_ids", "").split(",")
+                    for value in metadata.get(
+                        "com.vclip.telemetry.parent_ids", ""
+                    ).split(",")
                     if value.strip()
                 }
-                generated_source_start = variant in {
+
+                generated_timing = variant in {
                     "extended_master",
                     "repair_candidate",
-                } or (variant == "ready_cut" and current_id not in parent_ids)
+                } or (
+                    variant == "ready_cut"
+                    and current_id not in parent_ids
+                )
+                generated_clips.append((clip, generated_timing))
+                project_has_generated_timing = (
+                    project_has_generated_timing or generated_timing
+                )
 
-                if generated_source_start:
-                    ref = clip.get("ref") or ""
-                    asset = index.get(ref)
-                    if asset is not None and local_name(asset.tag) == "asset":
-                        asset_fmt = index.get(asset.get("format") or "")
-                        source_frame_raw = (
-                            asset_fmt.get("frameDuration")
-                            if asset_fmt is not None
-                            else None
+            # Historical originals, QC-original copies, and historical-ready
+            # copies retain their legacy timing exactly and are not audited here.
+            if not project_has_generated_timing:
+                continue
+
+            sequence_duration_raw = sequence.get("duration")
+            if sequence_duration_raw:
+                sequence_duration = parse_time(sequence_duration_raw)
+                if not _is_grid_aligned(sequence_duration, frame):
+                    errors.append(
+                        f"{project_name}: sequence duration "
+                        f"{sequence_duration_raw} is not aligned to {frame_raw}"
+                    )
+
+            for clip, generated_timing in generated_clips:
+                if not generated_timing:
+                    continue
+
+                duration_raw = clip.get("duration")
+                if duration_raw and not _is_grid_aligned(
+                    parse_time(duration_raw), frame
+                ):
+                    errors.append(
+                        f"{project_name}: asset-clip duration {duration_raw} "
+                        f"is not aligned to sequence {frame_raw}"
+                    )
+
+                ref = clip.get("ref") or ""
+                asset = index.get(ref)
+                if asset is None or local_name(asset.tag) != "asset":
+                    continue
+
+                asset_fmt = index.get(asset.get("format") or "")
+                source_frame_raw = (
+                    asset_fmt.get("frameDuration")
+                    if asset_fmt is not None
+                    else None
+                )
+                start_raw = clip.get("start")
+                if source_frame_raw and start_raw:
+                    source_frame = parse_time(source_frame_raw)
+                    relative_start = (
+                        parse_time(start_raw) - parse_time(asset.get("start"))
+                    )
+                    if not _is_grid_aligned(relative_start, source_frame):
+                        errors.append(
+                            f"{project_name}: generated source start {start_raw} "
+                            f"is not aligned to source {source_frame_raw} "
+                            f"relative to asset origin"
                         )
-                        start_raw = clip.get("start")
-                        if source_frame_raw and start_raw:
-                            source_frame = parse_time(source_frame_raw)
-                            relative_start = (
-                                parse_time(start_raw) - parse_time(asset.get("start"))
-                            )
-                            if not _is_grid_aligned(relative_start, source_frame):
-                                errors.append(
-                                    f"{project_name}: generated source start {start_raw} "
-                                    f"is not aligned to source {source_frame_raw} "
-                                    f"relative to asset origin"
-                                )
-    return errors
 
+    return errors
 
 def parse_input_shard(path: Path) -> tuple[ET.ElementTree, list[Anchor], dict[str, ET.Element]]:
     tree = ET.parse(path)
