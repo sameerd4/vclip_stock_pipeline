@@ -93,11 +93,14 @@ class Removal:
 
 
 def source_role(event_name: str, metadata: dict[str, str]) -> str | None:
-    variant = metadata.get("com.vclip.telemetry.variant", "").casefold()
+    # Product role is defined by the physical reconstruction event bucket.
+    # Internal telemetry variants describe how a candidate was generated and
+    # must not promote QC Review inventory into the customer-facing pool.
+    _ = metadata
     event = event_name.casefold()
-    if variant == "ready_cut" or "ready cuts" in event:
+    if "ready cuts" in event:
         return "ready_cut"
-    if variant == "extended_master" or "extended masters" in event:
+    if "extended masters" in event:
         return "extended_master"
     return None
 
@@ -356,6 +359,64 @@ def run(args: argparse.Namespace) -> int:
                     )
                 )
 
+    # Semantic safety gate: a separate location-consistency audit may identify
+    # duplicate-looking candidates whose known parent location provenance
+    # disagrees. Preserve those candidates rather than silently choosing one
+    # location lineage for customer-facing metadata.
+    preserved_location_conflicts: list[str] = []
+    if args.location_audit:
+        audit_path = args.location_audit.expanduser().resolve()
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+
+        missing_ids = audit.get("missing_candidate_ids") or []
+        if missing_ids:
+            raise RuntimeError(
+                "Location audit is incomplete; missing candidate IDs: "
+                + ", ".join(str(value) for value in missing_ids[:20])
+            )
+
+        if int(audit.get("removal_pairs", -1)) != len(removals):
+            raise RuntimeError(
+                "Location audit does not match this dedupe decision set: "
+                f"audit removal_pairs={audit.get('removal_pairs')}, "
+                f"current removals={len(removals)}"
+            )
+
+        preserve_ids = {
+            str(item["removed_stock_clip_id"])
+            for item in audit.get("conflicts", [])
+            if item.get("removed_stock_clip_id")
+        }
+        removal_ids = {item.removed_stock_clip_id for item in removals}
+        unexpected = sorted(preserve_ids - removal_ids)
+        if unexpected:
+            raise RuntimeError(
+                "Location audit asks to preserve IDs not removed by this run: "
+                + ", ".join(unexpected[:20])
+            )
+
+        if preserve_ids:
+            by_id = {row.stock_clip_id: row for row in all_rows}
+            missing_rows = sorted(preserve_ids - set(by_id))
+            if missing_rows:
+                raise RuntimeError(
+                    "Could not find location-conflict candidates in parsed corpus: "
+                    + ", ".join(missing_rows[:20])
+                )
+
+            for stock_id in preserve_ids:
+                row = by_id[stock_id]
+                row.kept = True
+                row.duplicate_of = None
+                row.duplicate_reason = None
+
+            removals = [
+                item
+                for item in removals
+                if item.removed_stock_clip_id not in preserve_ids
+            ]
+            preserved_location_conflicts = sorted(preserve_ids)
+
     # Mutate copies only after the global decision is complete.
     for row in all_rows:
         if row.kept:
@@ -419,6 +480,12 @@ def run(args: argparse.Namespace) -> int:
         "dry_run": args.dry_run,
         "containment_threshold": args.containment,
         "iou_threshold": args.iou,
+        "location_audit": (
+            str(args.location_audit.expanduser().resolve())
+            if args.location_audit
+            else None
+        ),
+        "location_conflicts_preserved": preserved_location_conflicts,
         "parse_failures": failures,
         "validation_failures": validation_failures,
         "conflicts": conflicts,
@@ -450,6 +517,10 @@ def run(args: argparse.Namespace) -> int:
     print(f"Candidate projects before: {len(all_rows):,}")
     print(f"Duplicate clusters:        {clusters_seen:,}")
     print(f"Projects removed:          {len(removals):,}")
+    print(
+        f"Location conflicts kept:   "
+        f"{len(preserved_location_conflicts):,}"
+    )
     print(f"Candidate projects after:  {len(active):,}")
     print(f"FCPXML files written:      {written:,}")
     print(f"Report:                    {args.report}")
@@ -468,6 +539,14 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--manifest", type=Path)
     p.add_argument("--containment", type=float, default=0.95)
     p.add_argument("--iou", type=float, default=0.90)
+    p.add_argument(
+        "--location-audit",
+        type=Path,
+        help=(
+            "Optional JSON from vclip_dedupe_location_audit.py. "
+            "Known parent-location conflicts are preserved instead of deduped."
+        ),
+    )
     p.add_argument("--dry-run", action="store_true")
     return p
 
