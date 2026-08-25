@@ -46,8 +46,33 @@ func axPress(_ element: AXUIElement) throws {
     }
 }
 
+func axPressAllowingModalTransition(
+    _ element: AXUIElement,
+    description: String
+) throws {
+    let error = AXUIElementPerformAction(element, kAXPressAction as CFString)
+    if error == .success {
+        return
+    }
+    if error.rawValue == -25204 { // kAXErrorCannotComplete
+        log("\(description): AX returned -25204 during modal transition; verifying resulting UI")
+        return
+    }
+    throw AXFailure(
+        description: "\(description) AXPress failed: \(error.rawValue)"
+    )
+}
+
 func axSetSelected(_ element: AXUIElement) -> Bool {
     AXUIElementSetAttributeValue(element, kAXSelectedAttribute as CFString, kCFBooleanTrue) == .success
+}
+
+func axSetStringValue(_ element: AXUIElement, _ value: String) -> Bool {
+    AXUIElementSetAttributeValue(
+        element,
+        kAXValueAttribute as CFString,
+        value as CFString
+    ) == .success
 }
 
 func axParent(_ element: AXUIElement) -> AXUIElement? {
@@ -281,7 +306,7 @@ func clickNext(_ appAX: AXUIElement) throws {
 
 func chooseSaveDirectory(_ appAX: AXUIElement, directory: String) throws {
     _ = try waitUntil(timeout: 120, description: "save panel") {
-        findButton(appAX, names: ["Save", "Choose", "Open", "Export"])
+        findButton(appAX, names: ["Share", "Save", "Choose", "Open", "Export"])
     }
     commandKey(5, shift: true) // Command-Shift-G
     RunLoop.current.run(until: Date().addingTimeInterval(0.35))
@@ -290,13 +315,193 @@ func chooseSaveDirectory(_ appAX: AXUIElement, directory: String) throws {
     keyEvent(36) // Return in Go to Folder
     RunLoop.current.run(until: Date().addingTimeInterval(0.8))
     let save = try waitUntil(timeout: 30, description: "Save/Choose button") {
-        findButton(appAX, names: ["Save", "Choose", "Open", "Export"])
+        findButton(appAX, names: ["Share", "Save", "Choose", "Open", "Export"])
     }
     try axPress(save)
     // The panel disappearing is stronger evidence than a blind delay.
     _ = try waitUntil(timeout: 60, description: "save panel dismissal") {
-        findButton(appAX, names: ["Save", "Choose", "Open", "Export"]) == nil ? true : nil
+        findButton(appAX, names: ["Share", "Save", "Choose", "Open", "Export"]) == nil ? true : nil
     }
+}
+
+
+extension String {
+    var casefolded: String {
+        folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+    }
+}
+
+func nearestDialogAncestor(_ element: AXUIElement) -> AXUIElement? {
+    var current: AXUIElement? = element
+    for _ in 0..<12 {
+        guard let candidate = current else { return nil }
+        let role = axString(candidate, kAXRoleAttribute)
+        let subrole = axString(candidate, kAXSubroleAttribute)
+        if role == "AXSheet" || role == "AXWindow" || subrole == "AXDialog" {
+            return candidate
+        }
+        current = axParent(candidate)
+    }
+    return nil
+}
+
+func findImportLibraryDialog(_ appAX: AXUIElement) -> AXUIElement? {
+    guard let choose = findButton(appAX, names: ["Choose"]) else { return nil }
+    guard let dialog = nearestDialogAncestor(choose) else { return nil }
+    let hasNew = findButton(dialog, names: ["New…", "New..."]) != nil
+    let text = descendants(of: dialog, maxDepth: 12)
+        .flatMap { texts($0) }
+        .joined(separator: " ")
+        .casefolded
+    return hasNew && (text.contains("library") || text.contains("import")) ? dialog : nil
+}
+
+func selectNamedElement(in root: AXUIElement, name: String) -> Bool {
+    let matches = findExactText(root, name)
+    for element in matches {
+        var current: AXUIElement? = element
+        for _ in 0..<8 {
+            guard let candidate = current else { break }
+            let role = axString(candidate, kAXRoleAttribute)
+            let actions = axActions(candidate)
+            if role == kAXRowRole || role == kAXOutlineRole {
+                if axSetSelected(candidate) { return true }
+            }
+            if actions.contains(kAXPressAction) {
+                do {
+                    try axPress(candidate)
+                    return true
+                } catch {
+                }
+            }
+            current = axParent(candidate)
+        }
+        if axSetSelected(element) { return true }
+    }
+    return false
+}
+
+func editableSaveNameField(_ root: AXUIElement) -> AXUIElement? {
+    descendants(of: root, maxDepth: 16).first { element in
+        let role = axString(element, kAXRoleAttribute)
+        let subrole = axString(element, kAXSubroleAttribute)
+        guard role == kAXTextFieldRole else { return false }
+        guard subrole != "AXSearchField" else { return false }
+        return axBool(element, kAXEnabledAttribute) ?? true
+    }
+}
+
+func findNativeSavePanel(_ appAX: AXUIElement) -> AXUIElement? {
+    for element in descendants(of: appAX, maxDepth: 20) {
+        guard axString(element, kAXRoleAttribute) == kAXButtonRole else {
+            continue
+        }
+        guard texts(element).contains("Save") else {
+            continue
+        }
+        guard let panel = nearestDialogAncestor(element) else {
+            continue
+        }
+        if editableSaveNameField(panel) != nil {
+            return panel
+        }
+    }
+    return nil
+}
+
+func createImportLibrary(
+    appAX: AXUIElement,
+    dialog: AXUIElement,
+    rootDirectory: String,
+    libraryName: String
+) throws {
+    try FileManager.default.createDirectory(
+        atPath: rootDirectory,
+        withIntermediateDirectories: true,
+        attributes: nil
+    )
+
+    guard let newButton = findButton(dialog, names: ["New…", "New..."]) else {
+        throw AXFailure(description: "Import-library dialog has no New button")
+    }
+
+    log("Creating Final Cut staging library: \(rootDirectory)/\(libraryName).fcpbundle")
+    try axPressAllowingModalTransition(
+        newButton,
+        description: "Open New Library save panel"
+    )
+
+    var savePanel = try waitUntil(
+        timeout: 30,
+        description: "New Library save panel"
+    ) {
+        findNativeSavePanel(appAX)
+    }
+
+    guard let nameField = editableSaveNameField(savePanel) else {
+        throw AXFailure(description: "Could not find New Library name field")
+    }
+    guard axSetStringValue(nameField, libraryName) else {
+        throw AXFailure(
+            description: "Could not set New Library name field to \(libraryName)"
+        )
+    }
+    log("Set staging library name: \(libraryName)")
+
+    commandKey(5, shift: true) // Command-Shift-G
+    RunLoop.current.run(until: Date().addingTimeInterval(0.45))
+    paste(rootDirectory)
+    RunLoop.current.run(until: Date().addingTimeInterval(0.30))
+    keyEvent(36)
+    RunLoop.current.run(until: Date().addingTimeInterval(0.90))
+
+    savePanel = try waitUntil(
+        timeout: 20,
+        description: "New Library save panel after folder navigation"
+    ) {
+        findNativeSavePanel(appAX)
+    }
+
+    let create = try waitUntil(
+        timeout: 20,
+        description: "New Library Save/Create button"
+    ) {
+        findButton(savePanel, names: ["Save", "Create"])
+    }
+    try axPressAllowingModalTransition(
+        create,
+        description: "Create New Library"
+    )
+}
+
+func handleImportLibraryDialog(
+    appAX: AXUIElement,
+    libraryRoot: String,
+    libraryName: String
+) throws {
+    let dialog = try waitUntil(timeout: 30, description: "FCPXML import library dialog") {
+        findImportLibraryDialog(appAX)
+    }
+
+    if !findExactText(dialog, libraryName).isEmpty {
+        log("Selecting existing Final Cut staging library: \(libraryName)")
+        guard selectNamedElement(in: dialog, name: libraryName) else {
+            throw AXFailure(description: "Found staging library \(libraryName) but could not select it")
+        }
+        let choose = try waitUntil(timeout: 10, description: "Import Choose button") {
+            findButton(dialog, names: ["Choose"])
+        }
+        try axPress(choose)
+        return
+    }
+
+    try createImportLibrary(
+        appAX: appAX,
+        dialog: dialog,
+        rootDirectory: libraryRoot,
+        libraryName: libraryName
+    )
 }
 
 func openXML(_ path: String) throws {
@@ -337,13 +542,15 @@ struct Arguments {
     var expected: Int?
     var output: String?
     var destination: String = "Export File (default)…"
+    var libraryRoot: String?
+    var libraryName: String?
 }
 
 func parseArguments() throws -> Arguments {
     var result = Arguments()
     var values = Array(CommandLine.arguments.dropFirst())
     guard !values.isEmpty else {
-        throw AXFailure(description: "Usage: vclip-fcp-ax probe | export-batch --xml PATH --event NAME --expected N --output DIR [--destination NAME]")
+        throw AXFailure(description: "Usage: vclip-fcp-ax probe | export-batch --xml PATH --event NAME --expected N --output DIR [--destination NAME] [--library-root DIR --library-name NAME]")
     }
     result.command = values.removeFirst()
     var index = 0
@@ -359,6 +566,8 @@ func parseArguments() throws -> Arguments {
         case "--expected": result.expected = Int(value)
         case "--output": result.output = value
         case "--destination": result.destination = value
+        case "--library-root": result.libraryRoot = value
+        case "--library-name": result.libraryName = value
         default: throw AXFailure(description: "Unknown option: \(key)")
         }
         index += 2
@@ -388,6 +597,19 @@ do {
         log("Opening \(xml)")
         try openXML(xml)
         activate(app)
+
+        if let libraryRoot = args.libraryRoot, let libraryName = args.libraryName {
+            log("Automating FCPXML import-library selection")
+            try handleImportLibraryDialog(
+                appAX: appAX,
+                libraryRoot: libraryRoot,
+                libraryName: libraryName
+            )
+            activate(app)
+        } else if args.libraryRoot != nil || args.libraryName != nil {
+            throw AXFailure(description: "--library-root and --library-name must be provided together")
+        }
+
         log("Waiting for imported event: \(event)")
         try selectNamedElement(appAX, name: event)
         activate(app)
@@ -412,6 +634,8 @@ do {
             "share_destination": args.destination,
             "share_menu_title": shareTitle,
             "fcp_pid": app.processIdentifier,
+            "library_root": args.libraryRoot ?? "",
+            "library_name": args.libraryName ?? "",
         ])
     default:
         throw AXFailure(description: "Unknown command: \(args.command)")
