@@ -16,6 +16,7 @@ def _src(
     city: str | None = "Seattle",
     neighborhood: str | None = None,
     state: str = "Washington",
+    country: str = "United States",
     lat: float | None = 47.61,
     lon: float | None = -122.32,
     confidence: str = "high",
@@ -31,7 +32,7 @@ def _src(
         neighborhood=neighborhood,
         city=city,
         state=state,
-        country="United States",
+        country=country,
         public_label=(
             f"{neighborhood}, {city}" if neighborhood and city else f"{city}, {state}"
         ),
@@ -83,7 +84,7 @@ def test_group_consensus_inheritance_without_fabricated_gps():
         ),
     }
     appearances = []
-    for stem, item in evidence.items():
+    for _stem, item in evidence.items():
         for clip_id in item.stock_clip_ids:
             appearances.append(
                 {
@@ -202,3 +203,153 @@ def test_coords_without_place_labels_are_not_false_mixed():
     assert label is None
     assert level is None
     assert any("coords_without_place_labels" in note for note in contradictions)
+
+
+def test_british_columbia_region_label_is_canada_not_united_states():
+    located = [
+        _src(
+            "westvan",
+            kind=JPG,
+            city="West Vancouver",
+            neighborhood="Sunset Beach",
+            state="British Columbia",
+            country="Canada",
+            lat=49.401449,
+            lon=-123.25558,
+        ),
+        _src(
+            "garibaldi",
+            kind=JPG,
+            city="Area D (Elaho/Garibaldi)",
+            neighborhood=None,
+            state="British Columbia",
+            country="Canada",
+            lat=49.561865,
+            lon=-123.234647,
+        ),
+    ]
+    coherence, label, level, contradictions = classify_group_coherence(located)
+    assert coherence == "region"
+    assert level == "region"
+    assert label == "British Columbia, Canada"
+    assert "United States" not in (label or "")
+    assert located[0].latitude == 49.401449
+    assert located[1].longitude == -123.234647
+    assert any("multiple_cities_same_region" in note for note in contradictions)
+
+
+def test_washington_region_label_stays_united_states():
+    located = [
+        _src("sea", kind=JPG, city="Seattle", lat=47.61, lon=-122.33),
+        _src(
+            "bli",
+            kind=JPG,
+            city="Bellingham",
+            state="Washington",
+            lat=48.75,
+            lon=-122.48,
+        ),
+    ]
+    coherence, label, level, contradictions = classify_group_coherence(located)
+    assert coherence == "region"
+    assert label == "Washington, United States"
+    assert any("multiple_cities_same_region" in note for note in contradictions)
+
+
+def test_mixed_canada_and_united_states_session_stays_unlabeled():
+    located = [
+        _src(
+            "slus",
+            kind=JPG,
+            city="Seattle",
+            neighborhood="South Lake Union",
+            state="Washington",
+            country="United States",
+            lat=47.619795,
+            lon=-122.34343,
+        ),
+        _src(
+            "van",
+            kind=JPG,
+            city="Vancouver",
+            neighborhood="Mount Pleasant",
+            state="British Columbia",
+            country="Canada",
+            lat=49.258858,
+            lon=-123.111019,
+        ),
+        _src(
+            "delta",
+            kind=JPG,
+            city="Delta",
+            neighborhood=None,
+            state="British Columbia",
+            country="Canada",
+            lat=49.094659,
+            lon=-122.933468,
+        ),
+    ]
+    coherence, label, level, contradictions = classify_group_coherence(located)
+    assert coherence == "mixed"
+    assert label is None
+    assert level is None
+    assert any("multiple_countries" in note for note in contradictions)
+
+
+def test_source_jpg_evidence_precedes_mixed_editorial_group():
+    evidence = {
+        "jpg1": _src(
+            "jpg1",
+            kind=JPG,
+            city="Seattle",
+            neighborhood="South Lake Union",
+            clips=["C_JPG_SEA"],
+        ),
+        "jpg2": _src(
+            "jpg2",
+            kind=JPG,
+            city="Vancouver",
+            neighborhood="Mount Pleasant",
+            state="British Columbia",
+            country="Canada",
+            lat=49.258858,
+            lon=-123.111019,
+            clips=["C_JPG_VAN"],
+        ),
+        "miss": SourceGeoEvidence(
+            source_basename="miss.mp4",
+            stem="miss",
+            evidence_kind="none",
+            stock_clip_ids=["C_UNRESOLVED"],
+        ),
+    }
+    appearances = []
+    for item in evidence.values():
+        for clip_id in item.stock_clip_ids:
+            appearances.append(
+                {
+                    "stockify_run_id": "RUN",
+                    "stock_clip_id": clip_id,
+                    "event_name": "Unknown Location — 2025-01-18 — Session 16",
+                    "source_basename": item.source_basename,
+                    "relative_xml": "session-16.fcpxml",
+                }
+            )
+    groups, summary = analyze_editorial_groups(
+        unknown_appearances=appearances,
+        source_evidence=evidence,
+    )
+    assert len(groups) == 1
+    group = groups[0]
+    assert group.geographic_coherence == "mixed"
+    assert group.recommended_group_label is None
+    assert group.unknown_clips_eligible_to_inherit == []
+    by_stem = {item["stem"]: item for item in group.source_evidence}
+    assert by_stem["jpg1"]["evidence_kind"] == JPG
+    assert by_stem["jpg1"]["latitude"] == 47.61
+    assert by_stem["jpg2"]["evidence_kind"] == JPG
+    assert by_stem["jpg2"]["city"] == "Vancouver"
+    assert by_stem["miss"]["evidence_kind"] == "none"
+    assert by_stem["miss"]["latitude"] is None
+    assert summary["clips_gaining_source_level_jpg_context"] == 2
+    assert summary["additional_clips_eligible_for_group_consensus"] == 0
