@@ -145,9 +145,28 @@ def wait_for_outputs(
 
         if all_present and all_stable and len(files) == len(expected):
             results: list[dict[str, Any]] = []
+            probe_not_ready: list[tuple[str, str]] = []
+
             for stem, item in expected.items():
                 path = by_stem[stem][0]
-                media = probe(path, ffprobe)
+
+                try:
+                    media = probe(path, ffprobe)
+                except Exception as exc:
+                    # Final Cut can leave the exported path size/mtime stable
+                    # briefly before the MP4/MOV container is fully finalized
+                    # (for example before the moov atom is readable).
+                    #
+                    # Never accept the file without a successful probe, but
+                    # also don't classify a transient container-finalization
+                    # race as permanent corruption. The overall worker timeout
+                    # remains the hard fail-closed boundary.
+                    stable_since[stem] = current
+                    probe_not_ready.append(
+                        (stem, f"{type(exc).__name__}: {exc}")
+                    )
+                    continue
+
                 fps = float(item.get("frame_rate") or media["frame_rate"] or 30.0)
                 tolerance = max(duration_tolerance, 2.0 / max(1.0, fps))
                 delta = abs(media["duration_seconds"] - float(item["duration_seconds"]))
@@ -174,6 +193,17 @@ def wait_for_outputs(
                         **media,
                     }
                 )
+
+            if probe_not_ready:
+                for stem, error in probe_not_ready[:5]:
+                    print(
+                        f"      waiting for container finalization: "
+                        f"{stem}: {error}",
+                        flush=True,
+                    )
+                time.sleep(poll_seconds)
+                continue
+
             return results
 
         done = sum(1 for stem in expected if stem in by_stem)
@@ -189,6 +219,13 @@ def wait_for_outputs(
 
 def run(args: argparse.Namespace) -> int:
     manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+    library_root = manifest.get("library_root")
+    library_name = manifest.get("library_name")
+    if bool(library_root) != bool(library_name):
+        raise RuntimeError(
+            "Export manifest must provide library_root and library_name together"
+        )
+
     items_by_batch: dict[str, list[dict[str, Any]]] = {}
     for item in manifest["items"]:
         items_by_batch.setdefault(item["batch_id"], []).append(item)
@@ -204,6 +241,8 @@ def run(args: argparse.Namespace) -> int:
     print(f"Plan:    {manifest['plan_id']}")
     print(f"Batches: {len(batches)}")
     print(f"Items:   {sum(len(items_by_batch[b['batch_id']]) for b in batches)}")
+    if library_root and library_name:
+        print(f"Library: {library_root}/{library_name}.fcpbundle")
     print()
 
     completed = 0
@@ -221,11 +260,66 @@ def run(args: argparse.Namespace) -> int:
 
         output_dir.mkdir(parents=True, exist_ok=True)
         existing = video_files(output_dir)
+
         if existing:
-            raise RuntimeError(
-                f"Output directory is not empty and has no complete receipt: {output_dir}. "
-                "Move/delete the partial run explicitly before retrying."
+            print(
+                f"    output directory contains {len(existing)} video file(s) "
+                "without a complete receipt; attempting recovery",
+                flush=True,
             )
+
+            try:
+                recovered_files = wait_for_outputs(
+                    output_dir=output_dir,
+                    expected_items=expected_items,
+                    ffprobe=args.ffprobe,
+                    timeout=args.recovery_timeout,
+                    stable_seconds=args.stable_seconds,
+                    poll_seconds=args.poll_seconds,
+                    duration_tolerance=args.duration_tolerance,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Output directory is non-empty but could not be safely "
+                    f"recovered: {output_dir}. "
+                    f"Existing files were preserved. Recovery error: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+
+            recovered_at = now()
+            receipt = {
+                "schema_version": 1,
+                "status": "complete",
+                "plan_id": manifest["plan_id"],
+                "batch_id": batch_id,
+                "started_at": recovered_at,
+                "completed_at": recovered_at,
+                "recovered_existing_outputs": True,
+                "files": recovered_files,
+            }
+
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            receipt_path.write_text(
+                json.dumps(receipt, indent=2),
+                encoding="utf-8",
+            )
+
+            update_batch_db(
+                args.db,
+                batch_id,
+                status="rendered",
+                receipt_path=str(receipt_path),
+                completed_at=recovered_at,
+                error_text=None,
+            )
+
+            completed += 1
+            print(
+                f"    recovered complete batch: "
+                f"{len(recovered_files)} master(s)",
+                flush=True,
+            )
+            continue
 
         started_at = now()
         update_batch_db(
@@ -235,6 +329,18 @@ def run(args: argparse.Namespace) -> int:
             started_at=started_at,
             error_text=None,
         )
+        resolutions = {
+            (int(item["width"]), int(item["height"]))
+            for item in expected_items
+            if item.get("width") and item.get("height")
+        }
+        if len(resolutions) != 1:
+            raise RuntimeError(
+                f"Batch {batch_id} must have exactly one expected resolution; "
+                f"found {sorted(resolutions)}"
+            )
+        expected_width, expected_height = next(iter(resolutions))
+
         command = [
             str(args.ax_binary),
             "export-batch",
@@ -248,7 +354,21 @@ def run(args: argparse.Namespace) -> int:
             batch["output_directory"],
             "--destination",
             manifest["share_destination"],
+            "--width",
+            str(expected_width),
+            "--height",
+            str(expected_height),
         ]
+        if library_root and library_name:
+            command.extend(
+                [
+                    "--library-root",
+                    str(library_root),
+                    "--library-name",
+                    str(library_name),
+                ]
+            )
+
         receipt_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             print("    driving Final Cut...", flush=True)
@@ -331,6 +451,12 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--stable-seconds", type=float, default=15)
     p.add_argument("--poll-seconds", type=float, default=5)
     p.add_argument("--duration-tolerance", type=float, default=0.25)
+    p.add_argument(
+        "--recovery-timeout",
+        type=float,
+        default=120,
+        help="Seconds to validate/finalize pre-existing batch outputs before failing closed.",
+    )
     p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--start-batch", type=int)
     p.add_argument("--limit-batches", type=int)

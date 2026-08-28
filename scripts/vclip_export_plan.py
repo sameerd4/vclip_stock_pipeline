@@ -176,6 +176,21 @@ def run(args: argparse.Namespace) -> int:
     xml_root = args.xml_root.expanduser().resolve()
     output_root = args.output_root.expanduser().resolve()
     render_root = args.render_root.expanduser().resolve()
+    library_root = (
+        args.library_root.expanduser().resolve()
+        if args.library_root
+        else None
+    )
+    library_name = (
+        args.library_name.strip()
+        if args.library_name and args.library_name.strip()
+        else None
+    )
+    if bool(library_root) != bool(library_name):
+        raise RuntimeError(
+            "--library-root and --library-name must be provided together"
+        )
+
     con = connect(args.db.expanduser().resolve())
     reconstruction_run_id, active = candidate_map(con)
 
@@ -204,6 +219,8 @@ def run(args: argparse.Namespace) -> int:
         "max_projects": args.max_projects,
         "share_destination": args.share_destination,
         "render_root": str(render_root),
+        "library_root": str(library_root) if library_root else None,
+        "library_name": library_name,
     }
     plan_id = "EXPORTPLAN_" + hashlib.sha256(
         json.dumps(signature_payload, sort_keys=True).encode("utf-8")
@@ -287,6 +304,8 @@ def run(args: argparse.Namespace) -> int:
         "render_root": str(render_root),
         "receipt_root": str(receipt_root),
         "share_destination": args.share_destination,
+        "library_root": str(library_root) if library_root else None,
+        "library_name": library_name,
         "max_projects_per_batch": args.max_projects,
         "batches": batches,
         "items": items,
@@ -301,6 +320,8 @@ def run(args: argparse.Namespace) -> int:
     print(f"Batches:           {len(batches):,}")
     print(f"Max per batch:     {args.max_projects}")
     print(f"Share destination: {args.share_destination}")
+    print(f"Library root:      {library_root or '(not configured)'}")
+    print(f"Library name:      {library_name or '(not configured)'}")
     print(f"Manifest:          {manifest_path}")
     return 0
 
@@ -313,6 +334,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--render-root", type=Path, required=True)
     p.add_argument("--max-projects", type=int, default=40)
     p.add_argument("--share-destination", default="Export File (default)…")
+    p.add_argument("--library-root", type=Path)
+    p.add_argument("--library-name")
     return p
 
 
