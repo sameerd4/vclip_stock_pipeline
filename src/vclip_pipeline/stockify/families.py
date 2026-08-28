@@ -237,9 +237,50 @@ def source_mod_date(project: ProjectBuild) -> str | None:
     return value if value else None
 
 
+def _orientation(width: int | None, height: int | None) -> str | None:
+    if (
+        not isinstance(width, int)
+        or not isinstance(height, int)
+        or width <= 0
+        or height <= 0
+    ):
+        return None
+    if width == height:
+        return "square"
+    return "landscape" if width > height else "vertical"
+
+
+def aspect_preservation_rank(project: ProjectBuild) -> int:
+    """Prefer timelines that preserve the accepted source media orientation."""
+    timeline_orientation = _orientation(
+        project.format_info.get("width"),
+        project.format_info.get("height"),
+    )
+
+    source_orientations: set[str] = set()
+    for candidate in project.accepted:
+        media = candidate.media_record
+        if media is None:
+            continue
+        orientation = _orientation(media.width, media.height)
+        if orientation is not None:
+            source_orientations.add(orientation)
+
+    if len(source_orientations) != 1:
+        return 1
+
+    source_orientation = next(iter(source_orientations))
+    if timeline_orientation == source_orientation:
+        return 2
+    if timeline_orientation == "square" and source_orientation != "square":
+        return 0
+    return 1
+
+
 def ranking_key(project: ProjectBuild) -> tuple:
     """Deterministic preference key; higher tuples win."""
     return (
+        aspect_preservation_rank(project),
         grading_coverage(project),
         useful_duration_seconds(project),
         len(project.accepted),
