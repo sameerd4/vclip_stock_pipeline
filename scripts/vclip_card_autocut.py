@@ -662,7 +662,7 @@ def build_fcpxml(
         counts,
         key=lambda key: (counts[key], key[0] * key[1]),
     )
-    root = ET.Element("fcpxml", {"version": "1.13"})
+    root = ET.Element("fcpxml", {"version": "1.12"})
     resources = ET.SubElement(root, "resources")
     formats: dict[tuple[int, int, Fraction], str] = {}
     assets: dict[Path, str] = {}
