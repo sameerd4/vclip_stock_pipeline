@@ -386,7 +386,24 @@ def persist_analysis(
     created = utc_now()
     analysis = result.analysis
     usage = result.usage
-    tags = [asdict(tag) for tag in analysis.tags]
+    raw_tags = [asdict(tag) for tag in analysis.tags]
+    tags_by_key = {}
+    for tag in raw_tags:
+        key = (tag["group"], tag["tag"])
+        current = tags_by_key.get(key)
+        if current is None:
+            tags_by_key[key] = tag
+            continue
+
+        current_score = current.get("score")
+        new_score = tag.get("score")
+        current_value = float(current_score) if current_score is not None else -1.0
+        new_value = float(new_score) if new_score is not None else -1.0
+
+        if new_value > current_value:
+            tags_by_key[key] = tag
+
+    tags = list(tags_by_key.values())
     subjects = [asdict(subject) for subject in analysis.named_subjects]
 
     evidence = {
@@ -894,6 +911,7 @@ def main() -> int:
                 )
 
             except Exception as exc:
+                con.rollback()
                 failed += 1
                 report_rows.append(
                     {
